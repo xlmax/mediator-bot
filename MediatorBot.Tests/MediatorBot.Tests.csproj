@@ -21,6 +21,7 @@
   <ItemGroup>
     <ProjectReference Include="..\MediatorBot.Core\MediatorBot.Core.csproj" />
     <ProjectReference Include="..\MediatorBot.Infrastructure\MediatorBot.Infrastructure.csproj" />
+    <ProjectReference Include="..\MediatorBot.Telegram\MediatorBot.Telegram.csproj" />
   </ItemGroup>
 
 </Project>

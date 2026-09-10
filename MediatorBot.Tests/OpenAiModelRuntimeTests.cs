@@ -34,21 +34,46 @@ public sealed class OpenAiModelRuntimeTests
     }
 
     [Fact]
-    public async Task ProcessAsync_ConvertsUnexpectedAssistantTextToMessageForCurrentAuthor()
+    public async Task ProcessAsync_TreatsUnexpectedAssistantTextAsProtocolFailure()
     {
+        const string rawAssistantText = "Обычный текст модели";
+        var logger = new RecordingLogger<OpenAiModelRuntime>();
         var context = CreateContext("Входящее сообщение");
         var client = new StubChatClient(_ => new OpenAiChatResponse(
             [],
-            "  Обычный текст модели  ",
+            rawAssistantText,
             "test-model",
             new OpenAiTokenUsage(10, 0, 5)));
+        var runtime = CreateRuntime(client, logger);
+
+        var exception = await Assert.ThrowsAsync<OpenAiProtocolException>(() =>
+            runtime.ProcessAsync(context));
+
+        Assert.Equal(
+            OpenAiProtocolFailureReason.UnexpectedAssistantText,
+            exception.Reason);
+        var log = Assert.Single(logger.Messages);
+        Assert.Contains(nameof(OpenAiProtocolException), log);
+        Assert.DoesNotContain(rawAssistantText, log);
+        Assert.DoesNotContain(context.IncomingMessage.Text, log);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RejectsMultipleToolCalls()
+    {
+        var client = new StubChatClient(_ => Response(
+            [
+                new OpenAiToolCall(OpenAiToolCatalog.NoAction, "{}"),
+                new OpenAiToolCall(OpenAiToolCatalog.NoAction, "{}")
+            ]));
         var runtime = CreateRuntime(client);
 
-        var result = await runtime.ProcessAsync(context);
+        var exception = await Assert.ThrowsAsync<OpenAiProtocolException>(() =>
+            runtime.ProcessAsync(CreateContext("Входящее сообщение")));
 
-        var action = Assert.IsType<SendToParticipant>(Assert.Single(result.Actions));
-        Assert.Equal(context.Author.Id, action.ParticipantId);
-        Assert.Equal("Обычный текст модели", action.Text);
+        Assert.Equal(
+            OpenAiProtocolFailureReason.MultipleToolCalls,
+            exception.Reason);
     }
 
     [Fact]

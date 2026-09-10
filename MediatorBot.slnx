@@ -2,5 +2,6 @@
   <Project Path="MediatorBot.Console/MediatorBot.Console.csproj" />
   <Project Path="MediatorBot.Core/MediatorBot.Core.csproj" />
   <Project Path="MediatorBot.Infrastructure/MediatorBot.Infrastructure.csproj" />
+  <Project Path="MediatorBot.Telegram/MediatorBot.Telegram.csproj" />
   <Project Path="MediatorBot.Tests/MediatorBot.Tests.csproj" />
 </Solution>

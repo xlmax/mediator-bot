@@ -1,0 +1,14 @@
+namespace MediatorBot.Telegram;
+
+public sealed class TelegramAdapterOptions
+{
+    public Guid SessionId { get; init; }
+
+    public long ParticipantAUserId { get; init; }
+
+    public long ParticipantBUserId { get; init; }
+
+    public required string ModelDisplayName { get; init; }
+
+    public TimeSpan DeliveryTimeout { get; init; } = TimeSpan.FromSeconds(30);
+}

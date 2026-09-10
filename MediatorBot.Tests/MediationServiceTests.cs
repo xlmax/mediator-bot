@@ -32,7 +32,16 @@ public sealed class MediationServiceTests
             [new SendToParticipant(context.Author.Id, $"Ответ для {context.Author.DisplayName}")]));
         var service = CreateService(store, runtime);
 
-        await service.HandleMessageAsync(session.Id, participantA.Id, "Сообщение A");
+        var firstActions = await service.HandleMessageAsync(
+            session.Id,
+            participantA.Id,
+            "Сообщение A");
+        var firstReply = Assert.IsType<SendToParticipant>(Assert.Single(firstActions));
+        await new MediatorDeliveryRecorder(store).RecordDeliveredAsync(
+            session.Id,
+            firstReply.ParticipantId,
+            firstReply.Text);
+
         await service.HandleMessageAsync(session.Id, participantB.Id, "Сообщение B");
 
         var context = runtime.Contexts[1];
@@ -72,7 +81,7 @@ public sealed class MediationServiceTests
     }
 
     [Fact]
-    public async Task FakeModelRuntime_AddressesActionAndSavedMessageToCurrentAuthor()
+    public async Task FakeModelRuntime_RecordsOutgoingMessageOnlyAfterDeliveryConfirmation()
     {
         var (session, _, participantB) = CreateSession();
         var store = new InMemoryConversationStore([session]);
@@ -87,6 +96,13 @@ public sealed class MediationServiceTests
         Assert.Equal(participantB.Id, action.ParticipantId);
         Assert.Equal(
             "Получил сообщение от B: У меня другая версия",
+            action.Text);
+
+        Assert.Single(await store.GetHistoryAsync(session.Id));
+
+        await new MediatorDeliveryRecorder(store).RecordDeliveredAsync(
+            session.Id,
+            action.ParticipantId,
             action.Text);
 
         var history = await store.GetHistoryAsync(session.Id);
@@ -106,7 +122,20 @@ public sealed class MediationServiceTests
             [new SendToBoth("Для A", "Для B")]));
         var service = CreateService(store, runtime);
 
-        await service.HandleMessageAsync(session.Id, participantA.Id, "Вопрос");
+        var actions = await service.HandleMessageAsync(
+            session.Id,
+            participantA.Id,
+            "Вопрос");
+        var send = Assert.IsType<SendToBoth>(Assert.Single(actions));
+        var recorder = new MediatorDeliveryRecorder(store);
+        await recorder.RecordDeliveredAsync(
+            session.Id,
+            participantA.Id,
+            send.TextForParticipantA);
+        await recorder.RecordDeliveredAsync(
+            session.Id,
+            participantB.Id,
+            send.TextForParticipantB);
 
         var history = await store.GetHistoryAsync(session.Id);
         Assert.Collection(

@@ -1,0 +1,539 @@
+using MediatorBot.Core;
+using MediatorBot.Infrastructure;
+using MediatorBot.Telegram;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace MediatorBot.Tests;
+
+public sealed class TelegramAdapterTests
+{
+    private const long ParticipantAUserId = 10001;
+    private const long ParticipantBUserId = 10002;
+
+    [Fact]
+    public async Task Registry_CreatesConfiguredSessionWhenItDoesNotExist()
+    {
+        var store = new InMemoryConversationStore();
+        var sessionId = Guid.NewGuid();
+        var registry = new TelegramParticipantRegistry(
+            store,
+            new TelegramAdapterOptions
+            {
+                SessionId = sessionId,
+                ParticipantAUserId = ParticipantAUserId,
+                ParticipantBUserId = ParticipantBUserId,
+                ModelDisplayName = "Fake"
+            });
+
+        await registry.InitializeAsync();
+
+        var session = await store.GetSessionAsync(sessionId);
+        Assert.NotNull(session);
+        Assert.NotEqual(session.ParticipantA.Id, session.ParticipantB.Id);
+    }
+
+    [Fact]
+    public async Task Registry_MapsConfiguredTelegramUsersToSessionParticipants()
+    {
+        var fixture = CreateFixture();
+
+        var bindingA = await fixture.Registry.FindByTelegramUserIdAsync(
+            ParticipantAUserId);
+        var bindingB = await fixture.Registry.FindByTelegramUserIdAsync(
+            ParticipantBUserId);
+
+        Assert.NotNull(bindingA);
+        Assert.NotNull(bindingB);
+        Assert.Equal(fixture.Session.Id, bindingA.Session.Id);
+        Assert.Equal(fixture.Session.ParticipantA.Id, bindingA.Participant.Id);
+        Assert.Equal(fixture.Session.Id, bindingB.Session.Id);
+        Assert.Equal(fixture.Session.ParticipantB.Id, bindingB.Participant.Id);
+    }
+
+    [Fact]
+    public async Task UnknownTelegramUser_CannotSendMessageToSession()
+    {
+        var runtime = new RecordingModelRuntime();
+        var fixture = CreateFixture(runtime);
+
+        var result = await fixture.Processor.ProcessPrivateTextAsync(
+            1,
+            99999,
+            "Попытка доступа");
+
+        Assert.Equal(TelegramMessageProcessingStatus.UnknownUser, result);
+        Assert.Empty(runtime.Contexts);
+        Assert.Empty(await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+        Assert.Empty(fixture.Transport.Deliveries);
+    }
+
+    [Fact]
+    public async Task UnknownTelegramUser_CannotUseSessionCommands()
+    {
+        var fixture = CreateFixture();
+        var commands = new TelegramCommandService(
+            fixture.Registry,
+            fixture.Store,
+            fixture.Options);
+
+        var responses = new[]
+        {
+            await commands.GetStartAsync(99999),
+            await commands.GetStatusAsync(99999),
+            await commands.GetHelpAsync(99999)
+        };
+
+        Assert.All(responses, response => Assert.False(response.IsAuthorized));
+        Assert.All(
+            responses,
+            response => Assert.DoesNotContain(fixture.Session.Id.ToString(), response.Text));
+    }
+
+    [Fact]
+    public async Task MessagesFromAAndB_UseTheirOwnParticipantsInSharedSession()
+    {
+        var runtime = new RecordingModelRuntime();
+        var fixture = CreateFixture(runtime);
+
+        await fixture.Processor.ProcessPrivateTextAsync(10, ParticipantAUserId, "От A");
+        await fixture.Processor.ProcessPrivateTextAsync(11, ParticipantBUserId, "От B");
+
+        Assert.Collection(
+            runtime.Contexts,
+            context =>
+            {
+                Assert.Equal(fixture.Session.Id, context.Session.Id);
+                Assert.Equal(fixture.Session.ParticipantA.Id, context.Author.Id);
+            },
+            context =>
+            {
+                Assert.Equal(fixture.Session.Id, context.Session.Id);
+                Assert.Equal(fixture.Session.ParticipantB.Id, context.Author.Id);
+            });
+    }
+
+    [Fact]
+    public async Task SendToParticipantA_IsDeliveredOnlyToA()
+    {
+        var fixture = CreateFixture();
+
+        await fixture.Dispatcher.DispatchAsync(
+            20,
+            ParticipantBUserId,
+            fixture.Session,
+            [new SendToParticipant(fixture.Session.ParticipantA.Id, "Только для A")]);
+
+        var delivery = Assert.Single(fixture.Transport.Deliveries);
+        Assert.Equal(ParticipantAUserId, delivery.TelegramUserId);
+        Assert.Equal("Только для A", delivery.Text);
+        var message = Assert.Single(await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+        Assert.Equal(fixture.Session.ParticipantA.Id, message.RecipientId);
+    }
+
+    [Fact]
+    public async Task SendToBoth_CreatesTwoSeparateDeliveriesAndHistoryMessages()
+    {
+        var fixture = CreateFixture();
+
+        await fixture.Dispatcher.DispatchAsync(
+            21,
+            ParticipantAUserId,
+            fixture.Session,
+            [new SendToBoth("Для A", "Для B")]);
+
+        Assert.Collection(
+            fixture.Transport.Deliveries,
+            delivery => Assert.Equal((ParticipantAUserId, "Для A"), delivery),
+            delivery => Assert.Equal((ParticipantBUserId, "Для B"), delivery));
+        var history = await fixture.Store.GetHistoryAsync(fixture.Session.Id);
+        Assert.Collection(
+            history,
+            message => Assert.Equal(fixture.Session.ParticipantA.Id, message.RecipientId),
+            message => Assert.Equal(fixture.Session.ParticipantB.Id, message.RecipientId));
+    }
+
+    [Fact]
+    public async Task NoAction_DoesNotSendOrCreateHistoryMessage()
+    {
+        var fixture = CreateFixture();
+
+        await fixture.Dispatcher.DispatchAsync(
+            22,
+            ParticipantAUserId,
+            fixture.Session,
+            [new NoAction()]);
+
+        Assert.Empty(fixture.Transport.Deliveries);
+        Assert.Empty(await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+    }
+
+    [Fact]
+    public async Task FailedDelivery_IsNotIncludedInNextModelContext()
+    {
+        var runtime = new RecordingModelRuntime();
+        var fixture = CreateFixture(runtime);
+        fixture.Transport.FailForTelegramUserId = ParticipantAUserId;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fixture.Dispatcher.DispatchAsync(
+                23,
+                ParticipantBUserId,
+                fixture.Session,
+                [new SendToParticipant(
+                    fixture.Session.ParticipantA.Id,
+                    "Недоставленный ответ")]));
+
+        fixture.Transport.FailForTelegramUserId = null;
+        await fixture.Processor.ProcessPrivateTextAsync(
+            24,
+            ParticipantBUserId,
+            "Следующее входящее");
+
+        var context = Assert.Single(runtime.Contexts);
+        Assert.Single(context.History);
+        Assert.DoesNotContain(
+            context.History,
+            message => message.Text == "Недоставленный ответ");
+    }
+
+    [Fact]
+    public async Task ModelProtocolFailure_ReturnsControlledStatusWithoutDelivery()
+    {
+        var fixture = CreateFixture(new ProtocolFailureModelRuntime());
+
+        var status = await fixture.Processor.ProcessPrivateTextAsync(
+            29,
+            ParticipantAUserId,
+            "Сообщение с ошибкой протокола");
+
+        Assert.Equal(TelegramMessageProcessingStatus.ModelProtocolFailure, status);
+        Assert.Empty(fixture.Transport.Deliveries);
+        var incoming = Assert.Single(
+            await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+        Assert.Equal(MessageDirection.ParticipantToMediator, incoming.Direction);
+    }
+
+    [Fact]
+    public async Task ProviderFailure_ReturnsUnavailableStatusWithoutDelivery()
+    {
+        var fixture = CreateFixture(new ProviderFailureModelRuntime());
+
+        var status = await fixture.Processor.ProcessPrivateTextAsync(
+            30,
+            ParticipantAUserId,
+            "Сообщение при недоступном провайдере");
+
+        Assert.Equal(TelegramMessageProcessingStatus.ModelUnavailable, status);
+        Assert.Empty(fixture.Transport.Deliveries);
+        var incoming = Assert.Single(
+            await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+        Assert.Equal(MessageDirection.ParticipantToMediator, incoming.Direction);
+    }
+
+    [Fact]
+    public async Task ConcurrentMessagesInSameSession_AreSerializedThroughDelivery()
+    {
+        var runtime = new DelayedFirstTurnModelRuntime();
+        var fixture = CreateFixture(runtime);
+
+        var firstTurn = fixture.Processor.ProcessPrivateTextAsync(
+            30,
+            ParticipantAUserId,
+            "Первое входящее");
+        await runtime.FirstTurnEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var secondTurn = fixture.Processor.ProcessPrivateTextAsync(
+            31,
+            ParticipantBUserId,
+            "Второе входящее");
+        await Task.Delay(100);
+        Assert.Equal(1, runtime.CallCount);
+
+        runtime.ReleaseFirstTurn.TrySetResult();
+        await Task.WhenAll(firstTurn, secondTurn);
+
+        Assert.Equal(2, runtime.CallCount);
+        var secondContext = runtime.Contexts[1];
+        Assert.Collection(
+            secondContext.History,
+            message => Assert.Equal("Первое входящее", message.Text),
+            message =>
+            {
+                Assert.Equal("Ответ первого turn", message.Text);
+                Assert.Equal(MessageDirection.MediatorToParticipant, message.Direction);
+            },
+            message => Assert.Equal("Второе входящее", message.Text));
+
+        var storedHistory = await fixture.Store.GetHistoryAsync(fixture.Session.Id);
+        Assert.Equal(
+            ["Первое входящее", "Ответ первого turn", "Второе входящее"],
+            storedHistory.Select(message => message.Text));
+    }
+
+    [Fact]
+    public async Task SendToBothPartialFailure_RecordsAAndReleasesSessionForNextTurn()
+    {
+        var fixture = CreateFixture(new SendToBothModelRuntime());
+        fixture.Transport.FailForTelegramUserId = ParticipantBUserId;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fixture.Processor.ProcessPrivateTextAsync(
+                32,
+                ParticipantAUserId,
+                "Первый turn"));
+
+        var historyAfterFailure = await fixture.Store.GetHistoryAsync(fixture.Session.Id);
+        Assert.Equal(2, historyAfterFailure.Count);
+        Assert.Equal("Для A", historyAfterFailure[1].Text);
+        Assert.Equal(fixture.Session.ParticipantA.Id, historyAfterFailure[1].RecipientId);
+        Assert.DoesNotContain(
+            historyAfterFailure,
+            message => message.RecipientId == fixture.Session.ParticipantB.Id);
+
+        fixture.Transport.FailForTelegramUserId = null;
+        var status = await fixture.Processor.ProcessPrivateTextAsync(
+            33,
+            ParticipantBUserId,
+            "Следующий turn").WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(TelegramMessageProcessingStatus.Processed, status);
+    }
+
+    [Fact]
+    public async Task DeliveryTimeout_ReleasesSessionForNextTurn()
+    {
+        var fixture = CreateFixture(
+            new SendToParticipantModelRuntime(),
+            TimeSpan.FromMilliseconds(50));
+        fixture.Transport.HangForTelegramUserId = ParticipantAUserId;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Processor.ProcessPrivateTextAsync(
+                34,
+                ParticipantAUserId,
+                "Turn с зависшей доставкой"));
+
+        fixture.Transport.HangForTelegramUserId = null;
+        var status = await fixture.Processor.ProcessPrivateTextAsync(
+            35,
+            ParticipantBUserId,
+            "Turn после timeout").WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(TelegramMessageProcessingStatus.Processed, status);
+        Assert.Contains(
+            fixture.Transport.Deliveries,
+            delivery => delivery.TelegramUserId == ParticipantBUserId);
+    }
+
+    [Fact]
+    public async Task SessionTurnCoordinator_AllowsDifferentSessionsInParallel()
+    {
+        var coordinator = new SessionTurnCoordinator();
+        var bothEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var enteredCount = 0;
+
+        async Task<int> Turn(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref enteredCount) == 2)
+            {
+                bothEntered.TrySetResult();
+            }
+
+            await release.Task.WaitAsync(cancellationToken);
+            return 1;
+        }
+
+        var first = coordinator.ExecuteAsync(Guid.NewGuid(), Turn);
+        var second = coordinator.ExecuteAsync(Guid.NewGuid(), Turn);
+        await bothEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        release.TrySetResult();
+
+        await Task.WhenAll(first, second);
+        Assert.Equal(2, enteredCount);
+    }
+
+    [Fact]
+    public async Task SessionTurnCoordinator_ReleasesSessionAfterException()
+    {
+        var coordinator = new SessionTurnCoordinator();
+        var sessionId = Guid.NewGuid();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            coordinator.ExecuteAsync<int>(
+                sessionId,
+                _ => throw new InvalidOperationException("Expected failure.")));
+
+        var result = await coordinator.ExecuteAsync(
+            sessionId,
+            _ => Task.FromResult(42)).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(42, result);
+    }
+
+    private static TelegramFixture CreateFixture(
+        IModelRuntime? runtime = null,
+        TimeSpan? deliveryTimeout = null)
+    {
+        var participantA = new Participant(Guid.NewGuid(), "A");
+        var participantB = new Participant(Guid.NewGuid(), "B");
+        var session = new Session(Guid.NewGuid(), participantA, participantB);
+        var store = new InMemoryConversationStore([session]);
+        var options = new TelegramAdapterOptions
+        {
+            SessionId = session.Id,
+            ParticipantAUserId = ParticipantAUserId,
+            ParticipantBUserId = ParticipantBUserId,
+            ModelDisplayName = "Fake",
+            DeliveryTimeout = deliveryTimeout ?? TimeSpan.FromSeconds(30)
+        };
+        var registry = new TelegramParticipantRegistry(store, options);
+        var transport = new RecordingTelegramTransport();
+        var recorder = new MediatorDeliveryRecorder(store);
+        var dispatcher = new TelegramMediatorActionDispatcher(
+            registry,
+            transport,
+            recorder,
+            options,
+            NullLogger<TelegramMediatorActionDispatcher>.Instance);
+        var modelRuntime = runtime ?? new RecordingModelRuntime();
+        var mediationService = new MediationService(
+            store,
+            modelRuntime,
+            new ConversationContextBuilder(store, 100));
+        var processor = new TelegramMessageProcessor(
+            registry,
+            mediationService,
+            dispatcher,
+            new SessionTurnCoordinator(),
+            options,
+            NullLogger<TelegramMessageProcessor>.Instance);
+
+        return new TelegramFixture(
+            session,
+            store,
+            options,
+            registry,
+            transport,
+            dispatcher,
+            processor);
+    }
+
+    private sealed record TelegramFixture(
+        Session Session,
+        InMemoryConversationStore Store,
+        TelegramAdapterOptions Options,
+        TelegramParticipantRegistry Registry,
+        RecordingTelegramTransport Transport,
+        TelegramMediatorActionDispatcher Dispatcher,
+        TelegramMessageProcessor Processor);
+
+    private sealed class RecordingModelRuntime : IModelRuntime
+    {
+        public List<ConversationContext> Contexts { get; } = [];
+
+        public Task<ModelResult> ProcessAsync(
+            ConversationContext context,
+            CancellationToken cancellationToken = default)
+        {
+            Contexts.Add(context);
+            return Task.FromResult(new ModelResult([new NoAction()]));
+        }
+    }
+
+    private sealed class ProtocolFailureModelRuntime : IModelRuntime
+    {
+        public Task<ModelResult> ProcessAsync(
+            ConversationContext context,
+            CancellationToken cancellationToken = default) =>
+            throw new OpenAiProtocolException("Simulated protocol failure.");
+    }
+
+    private sealed class ProviderFailureModelRuntime : IModelRuntime
+    {
+        public Task<ModelResult> ProcessAsync(
+            ConversationContext context,
+            CancellationToken cancellationToken = default) =>
+            throw new OpenAiProviderException(429);
+    }
+
+    private sealed class DelayedFirstTurnModelRuntime : IModelRuntime
+    {
+        private int _callCount;
+
+        public TaskCompletionSource FirstTurnEntered { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ReleaseFirstTurn { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<ConversationContext> Contexts { get; } = [];
+
+        public int CallCount => Volatile.Read(ref _callCount);
+
+        public async Task<ModelResult> ProcessAsync(
+            ConversationContext context,
+            CancellationToken cancellationToken = default)
+        {
+            var call = Interlocked.Increment(ref _callCount);
+            Contexts.Add(context);
+            if (call == 1)
+            {
+                FirstTurnEntered.TrySetResult();
+                await ReleaseFirstTurn.Task.WaitAsync(cancellationToken);
+                return new ModelResult(
+                    [new SendToParticipant(context.Author.Id, "Ответ первого turn")]);
+            }
+
+            return new ModelResult([new NoAction()]);
+        }
+    }
+
+    private sealed class SendToParticipantModelRuntime : IModelRuntime
+    {
+        public Task<ModelResult> ProcessAsync(
+            ConversationContext context,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<ModelResult>(new(
+                [new SendToParticipant(context.Author.Id, "Ответ")]));
+    }
+
+    private sealed class SendToBothModelRuntime : IModelRuntime
+    {
+        public Task<ModelResult> ProcessAsync(
+            ConversationContext context,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<ModelResult>(new(
+                [new SendToBoth("Для A", "Для B")]));
+    }
+
+    private sealed class RecordingTelegramTransport : ITelegramMessageTransport
+    {
+        public List<(long TelegramUserId, string Text)> Deliveries { get; } = [];
+
+        public long? FailForTelegramUserId { get; set; }
+
+        public long? HangForTelegramUserId { get; set; }
+
+        public Task SendTextMessageAsync(
+            long telegramUserId,
+            string text,
+            CancellationToken cancellationToken = default)
+        {
+            if (telegramUserId == FailForTelegramUserId)
+            {
+                throw new InvalidOperationException("Simulated Telegram failure.");
+            }
+
+            if (telegramUserId == HangForTelegramUserId)
+            {
+                return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+
+            Deliveries.Add((telegramUserId, text));
+            return Task.CompletedTask;
+        }
+    }
+}

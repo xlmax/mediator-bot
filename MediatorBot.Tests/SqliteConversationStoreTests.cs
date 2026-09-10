@@ -89,7 +89,15 @@ public sealed class SqliteConversationStoreTests
             new FakeModelRuntime(),
             new ConversationContextBuilder(firstStore, 100));
 
-        await firstService.HandleMessageAsync(session.Id, participantA.Id, "До перезапуска");
+        var firstActions = await firstService.HandleMessageAsync(
+            session.Id,
+            participantA.Id,
+            "До перезапуска");
+        var firstReply = Assert.IsType<SendToParticipant>(Assert.Single(firstActions));
+        await new MediatorDeliveryRecorder(firstStore).RecordDeliveredAsync(
+            session.Id,
+            firstReply.ParticipantId,
+            firstReply.Text);
 
         var restartedStore = database.CreateStore();
         var runtime = new CapturingModelRuntime();

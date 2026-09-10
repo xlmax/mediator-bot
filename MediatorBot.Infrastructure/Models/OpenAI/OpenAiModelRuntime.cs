@@ -47,26 +47,37 @@ public sealed class OpenAiModelRuntime : IModelRuntime
                 _options.MaxOutputTokens);
             var response = await _chatClient.CompleteAsync(request, cancellationToken);
 
+            if (response.ToolCalls.Count == 0)
+            {
+                var reason = string.IsNullOrWhiteSpace(response.AssistantText)
+                    ? OpenAiProtocolFailureReason.MissingToolCall
+                    : OpenAiProtocolFailureReason.UnexpectedAssistantText;
+                throw new OpenAiProtocolException(
+                    reason,
+                    "OpenAI returned no mediator tool call.");
+            }
+
+            if (response.ToolCalls.Count > 1)
+            {
+                throw new OpenAiProtocolException(
+                    OpenAiProtocolFailureReason.MultipleToolCalls,
+                    "OpenAI returned more than one mediator tool call.");
+            }
+
             IReadOnlyList<MediatorAction> actions;
-            var resultType = "ToolCalls";
-            if (response.ToolCalls.Count > 0)
+            try
             {
                 actions = _toolCallMapper.Map(context.Session, response.ToolCalls);
             }
-            else if (!string.IsNullOrWhiteSpace(response.AssistantText))
+            catch (Exception exception) when (
+                exception is InvalidDataException or
+                InvalidOperationException or
+                ArgumentException)
             {
-                actions =
-                [
-                    new SendToParticipant(
-                        context.Author.Id,
-                        response.AssistantText.Trim())
-                ];
-                resultType = "AssistantTextFallback";
-            }
-            else
-            {
-                actions = [new NoAction()];
-                resultType = "EmptyResponseFallback";
+                throw new OpenAiProtocolException(
+                    OpenAiProtocolFailureReason.InvalidToolCall,
+                    "OpenAI returned an invalid mediator tool call.",
+                    exception);
             }
 
             _logger.LogInformation(
@@ -80,10 +91,40 @@ public sealed class OpenAiModelRuntime : IModelRuntime
                 response.Usage.InputTokens,
                 response.Usage.CachedInputTokens,
                 response.Usage.OutputTokens,
-                resultType,
+                "ToolCalls",
                 string.Join(',', response.ToolCalls.Select(toolCall => toolCall.Name)));
 
             return new ModelResult(actions);
+        }
+        catch (OpenAiProviderException exception)
+        {
+            _logger.LogError(
+                "OpenAI-compatible provider failed. SessionId={SessionId} " +
+                "Model={Model} DurationMs={DurationMs:F1} ProviderCode={ProviderCode} " +
+                "ProviderErrorType={ProviderErrorType} ProviderName={ProviderName} " +
+                "ProviderParameter={ProviderParameter} ErrorType={ErrorType}",
+                context.Session.Id,
+                _options.Model,
+                Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                exception.ProviderCode,
+                exception.ProviderErrorType,
+                exception.ProviderName,
+                exception.ProviderParameter,
+                exception.GetType().Name);
+            throw;
+        }
+        catch (OpenAiProtocolException exception)
+        {
+            _logger.LogError(
+                "OpenAI protocol validation failed. SessionId={SessionId} " +
+                "Model={Model} DurationMs={DurationMs:F1} " +
+                "ProtocolReason={ProtocolReason} ErrorType={ErrorType}",
+                context.Session.Id,
+                _options.Model,
+                Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                exception.Reason,
+                exception.GetType().Name);
+            throw;
         }
         catch (Exception exception)
         {

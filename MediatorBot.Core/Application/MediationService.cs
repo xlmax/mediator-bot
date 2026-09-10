@@ -60,14 +60,14 @@ public sealed class MediationService
             ArgumentNullException.ThrowIfNull(result);
             ArgumentNullException.ThrowIfNull(result.Actions);
 
-            await SaveMediatorMessagesAsync(session, result.Actions, cancellationToken);
-
             _logger.LogInformation(
                 "Handled message. SessionId={SessionId} ParticipantId={ParticipantId} " +
-                "MessageId={MessageId} DurationMs={DurationMs:F1} ResultTypes={ResultTypes}",
+                "MessageId={MessageId} HistoryMessageCount={HistoryMessageCount} " +
+                "DurationMs={DurationMs:F1} ResultTypes={ResultTypes}",
                 sessionId,
                 participantId,
                 incomingMessage.Id,
+                context.History.Count,
                 Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                 string.Join(',', result.Actions.Select(action => action.GetType().Name)));
 
@@ -89,62 +89,4 @@ public sealed class MediationService
         }
     }
 
-    private async Task SaveMediatorMessagesAsync(
-        Session session,
-        IReadOnlyList<MediatorAction> actions,
-        CancellationToken cancellationToken)
-    {
-        foreach (var action in actions)
-        {
-            switch (action)
-            {
-                case SendToParticipant send:
-                    session.GetParticipant(send.ParticipantId);
-                    await SaveMediatorMessageAsync(
-                        session.Id,
-                        send.ParticipantId,
-                        send.Text,
-                        cancellationToken);
-                    break;
-
-                case SendToBoth send:
-                    await SaveMediatorMessageAsync(
-                        session.Id,
-                        session.ParticipantA.Id,
-                        send.TextForParticipantA,
-                        cancellationToken);
-                    await SaveMediatorMessageAsync(
-                        session.Id,
-                        session.ParticipantB.Id,
-                        send.TextForParticipantB,
-                        cancellationToken);
-                    break;
-
-                case NoAction:
-                    break;
-
-                default:
-                    throw new InvalidOperationException(
-                        $"Unsupported mediator action '{action.GetType().Name}'.");
-            }
-        }
-    }
-
-    private Task SaveMediatorMessageAsync(
-        Guid sessionId,
-        Guid recipientId,
-        string text,
-        CancellationToken cancellationToken)
-    {
-        var message = new Message(
-            Guid.NewGuid(),
-            sessionId,
-            null,
-            recipientId,
-            MessageDirection.MediatorToParticipant,
-            text,
-            DateTimeOffset.UtcNow);
-
-        return _conversationStore.SaveMessageAsync(message, cancellationToken);
-    }
 }

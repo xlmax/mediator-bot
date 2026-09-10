@@ -1,3 +1,7 @@
+using System.ClientModel;
+using System.ClientModel.Primitives;
+using System.Text.Json;
+using OpenAI;
 using OpenAI.Chat;
 
 namespace MediatorBot.Infrastructure;
@@ -5,6 +9,8 @@ namespace MediatorBot.Infrastructure;
 public sealed class OpenAiSdkChatClient : IOpenAiChatClient
 {
     private readonly ChatClient _client;
+    private readonly string _model;
+    private readonly OpenAiChatResponseParser _responseParser = new();
 
     public OpenAiSdkChatClient(OpenAiModelRuntimeOptions options)
     {
@@ -13,7 +19,16 @@ public sealed class OpenAiSdkChatClient : IOpenAiChatClient
         ArgumentException.ThrowIfNullOrWhiteSpace(options.Model);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.MaxOutputTokens);
 
-        _client = new ChatClient(options.Model, options.ApiKey);
+        _model = options.Model;
+        _client = options.Endpoint is null
+            ? new ChatClient(options.Model, options.ApiKey)
+            : new ChatClient(
+                options.Model,
+                new ApiKeyCredential(options.ApiKey),
+                new OpenAIClientOptions
+                {
+                    Endpoint = options.Endpoint
+                });
     }
 
     public async Task<OpenAiChatResponse> CompleteAsync(
@@ -22,62 +37,65 @@ public sealed class OpenAiSdkChatClient : IOpenAiChatClient
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        List<ChatMessage> messages =
-        [
-            new SystemChatMessage(request.SystemPrompt),
-            new UserChatMessage(request.ConversationPrompt)
-        ];
-
-        var completionOptions = new ChatCompletionOptions
+        var payload = new
         {
-            MaxOutputTokenCount = request.MaxOutputTokens,
-            ToolChoice = ChatToolChoice.CreateRequiredChoice(),
-            AllowParallelToolCalls = false,
-            StoredOutputEnabled = false
+            model = _model,
+            messages = new[]
+            {
+                new { role = "system", content = request.SystemPrompt },
+                new { role = "user", content = request.ConversationPrompt }
+            },
+            tools = request.Tools.Select(tool => new
+            {
+                type = "function",
+                function = new
+                {
+                    name = tool.Name,
+                    description = tool.Description,
+                    parameters = ParseParameters(tool.ParametersJson)
+                }
+            }),
+            tool_choice = "required",
+            max_tokens = request.MaxOutputTokens
         };
 
-        foreach (var tool in request.Tools)
+        var requestData = BinaryData.FromBytes(
+            JsonSerializer.SerializeToUtf8Bytes(payload));
+        using var content = BinaryContent.Create(requestData);
+        ClientResult result;
+        try
         {
-            completionOptions.Tools.Add(ChatTool.CreateFunctionTool(
-                tool.Name,
-                tool.Description,
-                BinaryData.FromString(tool.ParametersJson),
-                functionSchemaIsStrict: true));
+            result = await _client.CompleteChatAsync(
+                content,
+                new RequestOptions
+                {
+                    CancellationToken = cancellationToken
+                });
+        }
+        catch (ClientResultException exception)
+        {
+            var rawResponse = exception.GetRawResponse();
+            if (rawResponse is null)
+            {
+                throw new OpenAiProviderException(
+                    exception.Status,
+                    innerException: exception);
+            }
+
+            throw _responseParser.ParseProviderError(
+                rawResponse.Content,
+                exception.Status,
+                exception);
         }
 
-        ChatCompletion completion = await _client.CompleteChatAsync(
-            messages,
-            completionOptions,
-            cancellationToken);
+        return _responseParser.Parse(
+            result.GetRawResponse().Content,
+            _model);
+    }
 
-        if (completion.FinishReason == ChatFinishReason.Length)
-        {
-            throw new InvalidOperationException(
-                "OpenAI output ended because the output token limit was reached.");
-        }
-
-        if (completion.FinishReason == ChatFinishReason.ContentFilter)
-        {
-            throw new InvalidOperationException(
-                "OpenAI omitted output because of the content filter.");
-        }
-
-        var toolCalls = completion.ToolCalls
-            .Select(toolCall => new OpenAiToolCall(
-                toolCall.FunctionName,
-                toolCall.FunctionArguments.ToString()))
-            .ToArray();
-        var assistantText = string.Concat(
-            completion.Content.Select(part => part.Text));
-        var usage = new OpenAiTokenUsage(
-            completion.Usage.InputTokenCount,
-            completion.Usage.InputTokenDetails.CachedTokenCount,
-            completion.Usage.OutputTokenCount);
-
-        return new OpenAiChatResponse(
-            toolCalls,
-            assistantText,
-            completion.Model,
-            usage);
+    private static JsonElement ParseParameters(string parametersJson)
+    {
+        using var document = JsonDocument.Parse(parametersJson);
+        return document.RootElement.Clone();
     }
 }

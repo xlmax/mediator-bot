@@ -1,0 +1,137 @@
+using System.Reflection;
+using MediatorBot.Core;
+using MediatorBot.Infrastructure;
+using MediatorBot.Telegram;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using TeleFlow.Framework.Hosting;
+using TeleFlow.Storage.Memory;
+using TeleFlow.Telegram;
+
+var builder = Host.CreateApplicationBuilder(args);
+builder.Configuration.Sources.Clear();
+builder.Configuration
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false)
+    .AddJsonFile(
+        $"appsettings.{builder.Environment.EnvironmentName}.json",
+        optional: true)
+    .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true)
+    .AddEnvironmentVariables()
+    .AddCommandLine(args);
+
+var databasePath = RequireConfiguration("Storage:DatabasePath");
+var databaseKey = RequireConfiguration("Storage:DatabaseKey");
+var botToken = RequireConfiguration("Telegram:BotToken");
+var sessionIdText = RequireConfiguration("Telegram:SessionId");
+if (!Guid.TryParse(sessionIdText, out var sessionId) || sessionId == Guid.Empty)
+{
+    throw new InvalidOperationException("Telegram:SessionId must be a non-empty GUID.");
+}
+
+var participantAUserId = builder.Configuration.GetValue<long>(
+    "Telegram:ParticipantAUserId");
+var participantBUserId = builder.Configuration.GetValue<long>(
+    "Telegram:ParticipantBUserId");
+var maxHistoryMessages = builder.Configuration.GetValue<int?>(
+    "Storage:MaxHistoryMessages") ?? 100;
+ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHistoryMessages);
+var deliveryTimeoutSeconds = builder.Configuration.GetValue<int?>(
+    "Telegram:DeliveryTimeoutSeconds") ?? 30;
+ArgumentOutOfRangeException.ThrowIfNegativeOrZero(deliveryTimeoutSeconds);
+var modelRuntimeName = builder.Configuration["ModelRuntime"] ?? "Fake";
+var configuredModel = builder.Configuration["OpenAI:Model"] ?? "gpt-4.1-mini";
+
+builder.Services.AddSingleton(new SqliteConversationStoreOptions(
+    Path.GetFullPath(databasePath, Directory.GetCurrentDirectory()),
+    databaseKey));
+builder.Services.AddSingleton<SqliteConversationStore>();
+builder.Services.AddSingleton<IConversationStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IConversationContextBuilder>(services =>
+    new ConversationContextBuilder(
+        services.GetRequiredService<IConversationStore>(),
+        maxHistoryMessages));
+builder.Services.AddSingleton<IMediatorDeliveryRecorder, MediatorDeliveryRecorder>();
+builder.Services.AddSingleton<ISessionTurnCoordinator, SessionTurnCoordinator>();
+builder.Services.AddSingleton<MediationService>();
+
+if (modelRuntimeName.Equals("Fake", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<IModelRuntime, FakeModelRuntime>();
+}
+else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
+{
+    var apiKey = RequireConfiguration("OpenAI:ApiKey");
+    var endpointValue = builder.Configuration["OpenAI:Endpoint"];
+    if (!string.IsNullOrWhiteSpace(endpointValue) &&
+        !Uri.TryCreate(endpointValue, UriKind.Absolute, out _))
+    {
+        throw new InvalidOperationException(
+            "OpenAI:Endpoint must be an absolute URI.");
+    }
+
+    var endpoint = string.IsNullOrWhiteSpace(endpointValue)
+        ? null
+        : new Uri(endpointValue, UriKind.Absolute);
+    var maxOutputTokens = builder.Configuration.GetValue<int?>(
+        "OpenAI:MaxOutputTokens") ?? 1500;
+
+    builder.Services.AddSingleton(new OpenAiModelRuntimeOptions
+    {
+        ApiKey = apiKey,
+        Model = configuredModel,
+        Endpoint = endpoint,
+        MaxOutputTokens = maxOutputTokens
+    });
+    builder.Services.AddSingleton<IOpenAiChatClient, OpenAiSdkChatClient>();
+    builder.Services.AddSingleton<OpenAiConversationPromptBuilder>();
+    builder.Services.AddSingleton<OpenAiToolCallMapper>();
+    builder.Services.AddSingleton<IModelRuntime, OpenAiModelRuntime>();
+}
+else
+{
+    throw new InvalidOperationException(
+        $"Unknown ModelRuntime '{modelRuntimeName}'. Use 'Fake' or 'OpenAI'.");
+}
+
+builder.Services.AddSingleton(new TelegramAdapterOptions
+{
+    SessionId = sessionId,
+    ParticipantAUserId = participantAUserId,
+    ParticipantBUserId = participantBUserId,
+    ModelDisplayName = modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase)
+        ? configuredModel
+        : "Fake",
+    DeliveryTimeout = TimeSpan.FromSeconds(deliveryTimeoutSeconds)
+});
+builder.Services.AddSingleton<TelegramParticipantRegistry>();
+builder.Services.AddSingleton<AllowedParticipantFilter>();
+builder.Services.AddSingleton<TelegramCommandService>();
+builder.Services.AddSingleton<TelegramMediatorActionDispatcher>();
+builder.Services.AddSingleton<TelegramMessageProcessor>();
+builder.Services.AddSingleton<ITelegramMessageTransport, TeleFlowMessageTransport>();
+
+builder.Services.AddTelegramBot(options => options.Token = botToken);
+builder.Services.AddMemoryStateStorage();
+builder.Services.AddTelegramHandlersFromAssembly(Assembly.GetExecutingAssembly());
+builder.Services.AddLongPolling();
+
+// Registered before TeleFlow so the encrypted database and Session are ready
+// before long polling starts receiving updates.
+builder.Services.AddHostedService<TelegramSessionInitializer>();
+builder.Services.AddTeleFlowHostedService();
+
+await builder.Build().RunAsync();
+
+string RequireConfiguration(string key)
+{
+    var value = builder.Configuration[key];
+    if (string.IsNullOrWhiteSpace(value) || value.StartsWith("replace-with-"))
+    {
+        throw new InvalidOperationException($"Configuration value '{key}' is required.");
+    }
+
+    return value;
+}

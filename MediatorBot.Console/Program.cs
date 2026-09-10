@@ -10,6 +10,9 @@ builder.Configuration.Sources.Clear();
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false)
+    .AddJsonFile(
+        $"appsettings.{builder.Environment.EnvironmentName}.json",
+        optional: true)
     .AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true)
     .AddEnvironmentVariables()
     .AddCommandLine(args);
@@ -59,6 +62,17 @@ else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
 
     var model = builder.Configuration["OpenAI:Model"]
         ?? throw new InvalidOperationException("OpenAI:Model is not configured.");
+    var endpointValue = builder.Configuration["OpenAI:Endpoint"];
+    if (!string.IsNullOrWhiteSpace(endpointValue) &&
+        !Uri.TryCreate(endpointValue, UriKind.Absolute, out _))
+    {
+        throw new InvalidOperationException(
+            "OpenAI:Endpoint must be an absolute URI.");
+    }
+
+    var endpoint = string.IsNullOrWhiteSpace(endpointValue)
+        ? null
+        : new Uri(endpointValue, UriKind.Absolute);
     var maxOutputTokens = builder.Configuration.GetValue<int?>(
         "OpenAI:MaxOutputTokens") ?? 1500;
 
@@ -66,6 +80,7 @@ else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
     {
         ApiKey = apiKey,
         Model = model,
+        Endpoint = endpoint,
         MaxOutputTokens = maxOutputTokens
     });
     builder.Services.AddSingleton<IOpenAiChatClient, OpenAiSdkChatClient>();
@@ -80,6 +95,7 @@ else
 }
 
 builder.Services.AddSingleton<MediationService>();
+builder.Services.AddSingleton<IMediatorDeliveryRecorder, MediatorDeliveryRecorder>();
 
 using var host = builder.Build();
 var store = host.Services.GetRequiredService<SqliteConversationStore>();
@@ -99,6 +115,7 @@ System.Console.WriteLine(
 System.Console.WriteLine("Вводи сообщения по очереди; 'exit' завершает работу.");
 
 var mediationService = host.Services.GetRequiredService<MediationService>();
+var deliveryRecorder = host.Services.GetRequiredService<IMediatorDeliveryRecorder>();
 var currentParticipant = GetNextParticipant(session, history);
 while (true)
 {
@@ -122,7 +139,7 @@ while (true)
 
     foreach (var action in actions)
     {
-        Render(action, session);
+        await DeliverAsync(action, session, deliveryRecorder);
     }
 
     currentParticipant = currentParticipant.Id == session.ParticipantA.Id
@@ -166,20 +183,36 @@ static Participant GetNextParticipant(
         : session.ParticipantA;
 }
 
-static void Render(MediatorAction action, Session session)
+static async Task DeliverAsync(
+    MediatorAction action,
+    Session session,
+    IMediatorDeliveryRecorder deliveryRecorder)
 {
     switch (action)
     {
         case SendToParticipant send:
             var recipient = session.GetParticipant(send.ParticipantId);
             System.Console.WriteLine($"BOT -> {recipient.DisplayName}: {send.Text}");
+            await deliveryRecorder.RecordDeliveredAsync(
+                session.Id,
+                recipient.Id,
+                send.Text);
             break;
 
         case SendToBoth send:
             System.Console.WriteLine(
                 $"BOT -> {session.ParticipantA.DisplayName}: {send.TextForParticipantA}");
+            await deliveryRecorder.RecordDeliveredAsync(
+                session.Id,
+                session.ParticipantA.Id,
+                send.TextForParticipantA);
+
             System.Console.WriteLine(
                 $"BOT -> {session.ParticipantB.DisplayName}: {send.TextForParticipantB}");
+            await deliveryRecorder.RecordDeliveredAsync(
+                session.Id,
+                session.ParticipantB.Id,
+                send.TextForParticipantB);
             break;
 
         case NoAction:
