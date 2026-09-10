@@ -2,6 +2,10 @@ namespace MediatorBot.Core;
 
 public interface IConversationStore
 {
+    Task CreateSessionAsync(
+        Session session,
+        CancellationToken cancellationToken = default);
+
     Task<Session?> GetSessionAsync(
         Guid sessionId,
         CancellationToken cancellationToken = default);
@@ -12,5 +16,6 @@ public interface IConversationStore
 
     Task<IReadOnlyList<Message>> GetHistoryAsync(
         Guid sessionId,
+        int? maxMessages = null,
         CancellationToken cancellationToken = default);
 }

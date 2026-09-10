@@ -2,7 +2,11 @@ namespace MediatorBot.Core;
 
 public sealed record Session
 {
-    public Session(Guid id, Participant participantA, Participant participantB)
+    public Session(
+        Guid id,
+        Participant participantA,
+        Participant participantB,
+        DateTimeOffset? createdAt = null)
     {
         if (participantA.Id == participantB.Id)
         {
@@ -12,6 +16,7 @@ public sealed record Session
         Id = id;
         ParticipantA = participantA;
         ParticipantB = participantB;
+        CreatedAt = createdAt ?? DateTimeOffset.UtcNow;
     }
 
     public Guid Id { get; }
@@ -19,6 +24,8 @@ public sealed record Session
     public Participant ParticipantA { get; }
 
     public Participant ParticipantB { get; }
+
+    public DateTimeOffset CreatedAt { get; }
 
     public Participant GetParticipant(Guid participantId) => participantId switch
     {

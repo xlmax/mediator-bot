@@ -31,6 +31,15 @@ public sealed class InMemoryConversationStore : IConversationStore
         }
     }
 
+    public Task CreateSessionAsync(
+        Session session,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        AddSession(session);
+        return Task.CompletedTask;
+    }
+
     public Task<Session?> GetSessionAsync(
         Guid sessionId,
         CancellationToken cancellationToken = default)
@@ -57,7 +66,7 @@ public sealed class InMemoryConversationStore : IConversationStore
                 throw new KeyNotFoundException($"Session '{message.SessionId}' was not found.");
             }
 
-            session.GetParticipant(message.AuthorId);
+            ValidateParticipants(session, message);
             _messagesBySession[message.SessionId].Add(message);
         }
 
@@ -66,8 +75,14 @@ public sealed class InMemoryConversationStore : IConversationStore
 
     public Task<IReadOnlyList<Message>> GetHistoryAsync(
         Guid sessionId,
+        int? maxMessages = null,
         CancellationToken cancellationToken = default)
     {
+        if (maxMessages is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxMessages));
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
 
         lock (_lock)
@@ -77,7 +92,26 @@ public sealed class InMemoryConversationStore : IConversationStore
                 throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
             }
 
-            return Task.FromResult<IReadOnlyList<Message>>(messages.ToArray());
+            IEnumerable<Message> history = messages.OrderBy(message => message.CreatedAt);
+            if (maxMessages is not null)
+            {
+                history = history.TakeLast(maxMessages.Value);
+            }
+
+            return Task.FromResult<IReadOnlyList<Message>>(history.ToArray());
+        }
+    }
+
+    private static void ValidateParticipants(Session session, Message message)
+    {
+        if (message.AuthorId is Guid authorId)
+        {
+            session.GetParticipant(authorId);
+        }
+
+        if (message.RecipientId is Guid recipientId)
+        {
+            session.GetParticipant(recipientId);
         }
     }
 }
