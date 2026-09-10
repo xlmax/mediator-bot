@@ -28,6 +28,7 @@ if (string.IsNullOrWhiteSpace(databaseKey))
 var maxHistoryMessages = builder.Configuration.GetValue<int?>(
     "Storage:MaxHistoryMessages") ?? 100;
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHistoryMessages);
+var modelRuntimeName = builder.Configuration["ModelRuntime"] ?? "Fake";
 
 builder.Services.AddSingleton(new SqliteConversationStoreOptions(
     Path.GetFullPath(databasePath, Directory.GetCurrentDirectory()),
@@ -39,7 +40,45 @@ builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
         services.GetRequiredService<IConversationStore>(),
         maxHistoryMessages));
-builder.Services.AddSingleton<IModelRuntime, FakeModelRuntime>();
+
+if (modelRuntimeName.Equals("Fake", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<IModelRuntime, FakeModelRuntime>();
+}
+else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
+{
+    var apiKey = builder.Configuration["OpenAI:ApiKey"]
+        ?? builder.Configuration["OPENAI_API_KEY"];
+    if (string.IsNullOrWhiteSpace(apiKey))
+    {
+        throw new InvalidOperationException(
+            "The OpenAI API key is not configured. Set OpenAI__ApiKey or use " +
+            "'dotnet user-secrets set \"OpenAI:ApiKey\" \"<secret>\" " +
+            "--project MediatorBot.Console'.");
+    }
+
+    var model = builder.Configuration["OpenAI:Model"]
+        ?? throw new InvalidOperationException("OpenAI:Model is not configured.");
+    var maxOutputTokens = builder.Configuration.GetValue<int?>(
+        "OpenAI:MaxOutputTokens") ?? 1500;
+
+    builder.Services.AddSingleton(new OpenAiModelRuntimeOptions
+    {
+        ApiKey = apiKey,
+        Model = model,
+        MaxOutputTokens = maxOutputTokens
+    });
+    builder.Services.AddSingleton<IOpenAiChatClient, OpenAiSdkChatClient>();
+    builder.Services.AddSingleton<OpenAiConversationPromptBuilder>();
+    builder.Services.AddSingleton<OpenAiToolCallMapper>();
+    builder.Services.AddSingleton<IModelRuntime, OpenAiModelRuntime>();
+}
+else
+{
+    throw new InvalidOperationException(
+        $"Unknown ModelRuntime '{modelRuntimeName}'. Use 'Fake' or 'OpenAI'.");
+}
+
 builder.Services.AddSingleton<MediationService>();
 
 using var host = builder.Build();
@@ -52,6 +91,7 @@ var session = await GetOrCreateSessionAsync(
 var history = await store.GetHistoryAsync(session.Id);
 
 System.Console.WriteLine($"SessionId: {session.Id}");
+System.Console.WriteLine($"ModelRuntime: {modelRuntimeName}");
 System.Console.WriteLine($"Восстановлено сообщений: {history.Count}");
 System.Console.WriteLine(
     "Для продолжения этой сессии: dotnet run --project MediatorBot.Console -- " +
