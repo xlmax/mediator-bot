@@ -6,6 +6,8 @@ public sealed record ConversationContext(
     IReadOnlyList<Message> History,
     Message IncomingMessage)
 {
+    public ConversationSummary? Summary { get; init; }
+
     public IReadOnlyList<MediatedRequest> OpenMediatedRequests { get; init; } = [];
 
     public Participant ParticipantA => Session.ParticipantA;

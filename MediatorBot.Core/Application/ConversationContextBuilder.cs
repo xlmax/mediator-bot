@@ -4,18 +4,21 @@ public sealed class ConversationContextBuilder : IConversationContextBuilder
 {
     private readonly IConversationStore _conversationStore;
     private readonly IMediatedRequestStore _mediatedRequestStore;
+    private readonly IConversationCompactionStore? _compactionStore;
     private readonly int _maxHistoryMessages;
 
     public ConversationContextBuilder(
         IConversationStore conversationStore,
         IMediatedRequestStore mediatedRequestStore,
-        int maxHistoryMessages)
+        int maxHistoryMessages,
+        IConversationCompactionStore? compactionStore = null)
     {
         ArgumentNullException.ThrowIfNull(conversationStore);
         ArgumentNullException.ThrowIfNull(mediatedRequestStore);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHistoryMessages);
         _conversationStore = conversationStore;
         _mediatedRequestStore = mediatedRequestStore;
+        _compactionStore = compactionStore ?? conversationStore as IConversationCompactionStore;
         _maxHistoryMessages = maxHistoryMessages;
     }
 
@@ -44,7 +47,10 @@ public sealed class ConversationContextBuilder : IConversationContextBuilder
         var openRequestsTask = _mediatedRequestStore.GetOpenAsync(
             session.Id,
             cancellationToken);
-        await Task.WhenAll(historyTask, openRequestsTask);
+        var summaryTask = _compactionStore is null
+            ? Task.FromResult<ConversationSummary?>(null)
+            : _compactionStore.GetSummaryAsync(session.Id, cancellationToken);
+        await Task.WhenAll(historyTask, openRequestsTask, summaryTask);
 
         return new ConversationContext(
             session,
@@ -52,6 +58,7 @@ public sealed class ConversationContextBuilder : IConversationContextBuilder
             await historyTask,
             incomingMessage)
         {
+            Summary = await summaryTask,
             OpenMediatedRequests = await openRequestsTask
         };
     }

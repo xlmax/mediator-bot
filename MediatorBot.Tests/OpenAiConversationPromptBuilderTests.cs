@@ -57,6 +57,48 @@ public sealed class OpenAiConversationPromptBuilderTests
     }
 
     [Fact]
+    public void Build_IncludesDurableMemoryWithExplicitPrivacyBoundary()
+    {
+        var participantA = new Participant(Guid.NewGuid(), "Алекс");
+        var participantB = new Participant(Guid.NewGuid(), "Борис");
+        var session = new Session(Guid.NewGuid(), participantA, participantB);
+        var incoming = new Message(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            null,
+            MessageDirection.ParticipantToMediator,
+            "Текущее",
+            DateTimeOffset.UtcNow);
+        var context = new ConversationContext(
+            session,
+            participantA,
+            [incoming],
+            incoming)
+        {
+            Summary = new ConversationSummary(
+                session.Id,
+                2,
+                50,
+                new ConversationSummaryContent(
+                    "Приватный контекст A",
+                    "Приватный контекст B",
+                    "Общая договорённость",
+                    "Важная граница"),
+                DateTimeOffset.UtcNow)
+        };
+
+        var prompt = new OpenAiConversationPromptBuilder().Build(context);
+
+        Assert.Contains("DURABLE MEDIATOR MEMORY", prompt);
+        Assert.Contains("сама по себе не даёт разрешения", prompt);
+        Assert.Contains("Приватный контекст A", prompt);
+        Assert.Contains("Приватный контекст B", prompt);
+        Assert.Contains("Общая договорённость", prompt);
+        Assert.Contains("Важная граница", prompt);
+    }
+
+    [Fact]
     public void Build_IncludesDurableOpenMediatedRequests()
     {
         var participantA = new Participant(Guid.NewGuid(), "Алекс");

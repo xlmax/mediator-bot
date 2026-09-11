@@ -10,7 +10,9 @@ public sealed class SqliteConversationStore :
     IConversationStore,
     IParticipantIdentityStore,
     IExternalUpdateStore,
-    IMediatedRequestStore
+    IExternalTurnQueueStore,
+    IMediatedRequestStore,
+    IConversationCompactionStore
 {
     private const string SchemaResourceName =
         "MediatorBot.Infrastructure.Persistence.Schema.sql";
@@ -366,6 +368,115 @@ public sealed class SqliteConversationStore :
         return affectedRows == 1;
     }
 
+    public async Task<bool> TryEnqueueAsync(
+        PendingExternalTurn turn,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(turn);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.Source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.ExternalUpdateId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.ExternalUserId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.Text);
+        ArgumentOutOfRangeException.ThrowIfNegative(turn.SourceSequence);
+        await EnsureInitializedAsync(cancellationToken);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var registered = await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO ExternalUpdates (
+                Source, SessionId, ExternalUpdateId, RegisteredAt)
+            VALUES (
+                @Source, @SessionId, @ExternalUpdateId, @RegisteredAt)
+            ON CONFLICT (Source, SessionId, ExternalUpdateId) DO NOTHING;
+            """,
+            new
+            {
+                turn.Source,
+                SessionId = Format(turn.SessionId),
+                turn.ExternalUpdateId,
+                RegisteredAt = Format(turn.CreatedAt)
+            },
+            transaction,
+            cancellationToken: cancellationToken));
+        if (registered == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return false;
+        }
+
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO PendingTurns (
+                Id, SessionId, ParticipantId, Source, ExternalUpdateId,
+                SourceSequence, ExternalUserId, Text, CreatedAt)
+            VALUES (
+                @Id, @SessionId, @ParticipantId, @Source, @ExternalUpdateId,
+                @SourceSequence, @ExternalUserId, @Text, @CreatedAt);
+            """,
+            new
+            {
+                Id = Format(turn.Id),
+                SessionId = Format(turn.SessionId),
+                ParticipantId = Format(turn.ParticipantId),
+                turn.Source,
+                turn.ExternalUpdateId,
+                turn.SourceSequence,
+                turn.ExternalUserId,
+                turn.Text,
+                CreatedAt = Format(turn.CreatedAt)
+            },
+            transaction,
+            cancellationToken: cancellationToken));
+        await transaction.CommitAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<IReadOnlyList<PendingExternalTurn>> GetPendingAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var rows = await connection.QueryAsync<PendingExternalTurnRow>(new CommandDefinition(
+            """
+            SELECT Id, SessionId, ParticipantId, Source, ExternalUpdateId,
+                   SourceSequence, ExternalUserId, Text, CreatedAt
+            FROM PendingTurns
+            WHERE SessionId = @SessionId
+            ORDER BY SourceSequence, CreatedAt, Id;
+            """,
+            new { SessionId = Format(sessionId) },
+            cancellationToken: cancellationToken));
+        return rows.Select(ToPendingExternalTurn).ToArray();
+    }
+
+    public async Task CompleteAsync(
+        Guid sessionId,
+        Guid turnId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var affectedRows = await connection.ExecuteAsync(new CommandDefinition(
+            """
+            DELETE FROM PendingTurns
+            WHERE SessionId = @SessionId
+              AND Id = @Id;
+            """,
+            new
+            {
+                SessionId = Format(sessionId),
+                Id = Format(turnId)
+            },
+            cancellationToken: cancellationToken));
+        if (affectedRows != 1)
+        {
+            throw new KeyNotFoundException(
+                $"Pending turn '{turnId}' was not found in session '{sessionId}'.");
+        }
+    }
+
     public async Task EnsureBindingsAsync(
         Guid sessionId,
         string identityProvider,
@@ -507,6 +618,207 @@ public sealed class SqliteConversationStore :
         return rows.Select(ToMessage).ToArray();
     }
 
+    public async Task<ConversationSummary?> GetSummaryAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var row = await connection.QuerySingleOrDefaultAsync<ConversationSummaryRow>(
+            new CommandDefinition(
+                """
+                SELECT SessionId, Version, CompactedThroughSequence,
+                       PrivateContextFromParticipantA,
+                       PrivateContextFromParticipantB,
+                       SharedContextAndAgreements,
+                       BoundariesAndSafety, UpdatedAt
+                FROM ConversationSummaries
+                WHERE SessionId = @SessionId;
+                """,
+                new { SessionId = Format(sessionId) },
+                cancellationToken: cancellationToken));
+        return row is null ? null : ToConversationSummary(row);
+    }
+
+    public async Task<ConversationCompactionBatch?> GetCompactionBatchAsync(
+        Guid sessionId,
+        int triggerMessageCount,
+        int triggerCharacterCount,
+        int retainRecentMessageCount,
+        int retainRecentCharacterCount,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateCompactionThresholds(
+            triggerMessageCount,
+            triggerCharacterCount,
+            retainRecentMessageCount,
+            retainRecentCharacterCount);
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        using var result = await connection.QueryMultipleAsync(new CommandDefinition(
+            """
+            SELECT SessionId, Version, CompactedThroughSequence,
+                   PrivateContextFromParticipantA,
+                   PrivateContextFromParticipantB,
+                   SharedContextAndAgreements,
+                   BoundariesAndSafety, UpdatedAt
+            FROM ConversationSummaries
+            WHERE SessionId = @SessionId;
+
+            SELECT Sequence, Id, SessionId, AuthorId, RecipientId,
+                   Direction, Text, CreatedAt
+            FROM Messages
+            WHERE SessionId = @SessionId
+            ORDER BY Sequence;
+            """,
+            new { SessionId = Format(sessionId) },
+            cancellationToken: cancellationToken));
+
+        var summaryRow = await result.ReadSingleOrDefaultAsync<ConversationSummaryRow>();
+        var messageRows = (await result.ReadAsync<MessageRow>()).ToArray();
+        var totalCharacters = messageRows.Sum(row => row.Text.Length);
+        if (messageRows.Length < triggerMessageCount &&
+            totalCharacters < triggerCharacterCount)
+        {
+            return null;
+        }
+
+        var retainedCount = 0;
+        var retainedCharacters = 0;
+        for (var index = messageRows.Length - 1; index >= 0; index--)
+        {
+            var messageCharacters = messageRows[index].Text.Length;
+            if (retainedCount >= retainRecentMessageCount ||
+                (retainedCount > 0 &&
+                 retainedCharacters + messageCharacters > retainRecentCharacterCount))
+            {
+                break;
+            }
+
+            retainedCount++;
+            retainedCharacters += messageCharacters;
+        }
+
+        var compactedCount = messageRows.Length - retainedCount;
+        if (compactedCount <= 0)
+        {
+            return null;
+        }
+
+        var compactedRows = messageRows.Take(compactedCount).ToArray();
+        return new ConversationCompactionBatch(
+            sessionId,
+            summaryRow?.Version ?? 0,
+            compactedRows[^1].Sequence,
+            summaryRow is null ? null : ToSummaryContent(summaryRow),
+            compactedRows
+                .Select(row => new SequencedMessage(row.Sequence, ToMessage(row)))
+                .ToArray());
+    }
+
+    public async Task CommitCompactionAsync(
+        Guid sessionId,
+        long expectedSummaryVersion,
+        long compactedThroughSequence,
+        ConversationSummaryContent summary,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(summary);
+        ArgumentOutOfRangeException.ThrowIfNegative(expectedSummaryVersion);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(compactedThroughSequence);
+        await EnsureInitializedAsync(cancellationToken);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var currentVersion = await connection.ExecuteScalarAsync<long?>(new CommandDefinition(
+            """
+            SELECT Version
+            FROM ConversationSummaries
+            WHERE SessionId = @SessionId;
+            """,
+            new { SessionId = Format(sessionId) },
+            transaction,
+            cancellationToken: cancellationToken));
+        if ((currentVersion ?? 0) != expectedSummaryVersion)
+        {
+            throw new InvalidOperationException(
+                "Conversation summary changed while compaction was running.");
+        }
+
+        var compactedMessageCount = await connection.ExecuteScalarAsync<long>(
+            new CommandDefinition(
+                """
+                SELECT COUNT(*)
+                FROM Messages
+                WHERE SessionId = @SessionId
+                  AND Sequence <= @CompactedThroughSequence;
+                """,
+                new
+                {
+                    SessionId = Format(sessionId),
+                    CompactedThroughSequence = compactedThroughSequence
+                },
+                transaction,
+                cancellationToken: cancellationToken));
+        if (compactedMessageCount == 0)
+        {
+            throw new InvalidOperationException(
+                "Compaction cutoff does not contain any conversation messages.");
+        }
+
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO ConversationSummaries (
+                SessionId, Version, CompactedThroughSequence,
+                PrivateContextFromParticipantA,
+                PrivateContextFromParticipantB,
+                SharedContextAndAgreements,
+                BoundariesAndSafety, UpdatedAt)
+            VALUES (
+                @SessionId, @Version, @CompactedThroughSequence,
+                @PrivateContextFromParticipantA,
+                @PrivateContextFromParticipantB,
+                @SharedContextAndAgreements,
+                @BoundariesAndSafety, @UpdatedAt)
+            ON CONFLICT (SessionId) DO UPDATE SET
+                Version = excluded.Version,
+                CompactedThroughSequence = excluded.CompactedThroughSequence,
+                PrivateContextFromParticipantA = excluded.PrivateContextFromParticipantA,
+                PrivateContextFromParticipantB = excluded.PrivateContextFromParticipantB,
+                SharedContextAndAgreements = excluded.SharedContextAndAgreements,
+                BoundariesAndSafety = excluded.BoundariesAndSafety,
+                UpdatedAt = excluded.UpdatedAt;
+            """,
+            new
+            {
+                SessionId = Format(sessionId),
+                Version = expectedSummaryVersion + 1,
+                CompactedThroughSequence = compactedThroughSequence,
+                summary.PrivateContextFromParticipantA,
+                summary.PrivateContextFromParticipantB,
+                summary.SharedContextAndAgreements,
+                summary.BoundariesAndSafety,
+                UpdatedAt = Format(updatedAt)
+            },
+            transaction,
+            cancellationToken: cancellationToken));
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            DELETE FROM Messages
+            WHERE SessionId = @SessionId
+              AND Sequence <= @CompactedThroughSequence;
+            """,
+            new
+            {
+                SessionId = Format(sessionId),
+                CompactedThroughSequence = compactedThroughSequence
+            },
+            transaction,
+            cancellationToken: cancellationToken));
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
     {
         if (_initialized)
@@ -600,6 +912,25 @@ public sealed class SqliteConversationStore :
         }
     }
 
+    private static void ValidateCompactionThresholds(
+        int triggerMessageCount,
+        int triggerCharacterCount,
+        int retainRecentMessageCount,
+        int retainRecentCharacterCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(triggerMessageCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(triggerCharacterCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(retainRecentMessageCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(retainRecentCharacterCount);
+        if (retainRecentMessageCount >= triggerMessageCount ||
+            retainRecentCharacterCount >= triggerCharacterCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(retainRecentMessageCount),
+                "Retained history must be below its compaction trigger.");
+        }
+    }
+
     private static void ValidateExpectedBindings(
         IReadOnlyCollection<ParticipantIdentityBinding> expectedBindings)
     {
@@ -640,6 +971,33 @@ public sealed class SqliteConversationStore :
         ParseGuid(row.AuthorId),
         ParseGuid(row.RecipientId),
         Enum.Parse<MessageDirection>(row.Direction),
+        row.Text,
+        ParseTimestamp(row.CreatedAt));
+
+    private static ConversationSummary ToConversationSummary(
+        ConversationSummaryRow row) => new(
+        Guid.Parse(row.SessionId),
+        row.Version,
+        row.CompactedThroughSequence,
+        ToSummaryContent(row),
+        ParseTimestamp(row.UpdatedAt));
+
+    private static ConversationSummaryContent ToSummaryContent(
+        ConversationSummaryRow row) => new(
+        row.PrivateContextFromParticipantA,
+        row.PrivateContextFromParticipantB,
+        row.SharedContextAndAgreements,
+        row.BoundariesAndSafety);
+
+    private static PendingExternalTurn ToPendingExternalTurn(
+        PendingExternalTurnRow row) => new(
+        Guid.Parse(row.Id),
+        Guid.Parse(row.SessionId),
+        Guid.Parse(row.ParticipantId),
+        row.Source,
+        row.ExternalUpdateId,
+        row.SourceSequence,
+        row.ExternalUserId,
         row.Text,
         ParseTimestamp(row.CreatedAt));
 
@@ -721,8 +1079,50 @@ public sealed class SqliteConversationStore :
         public string? ResolvedAt { get; init; }
     }
 
+    private sealed class PendingExternalTurnRow
+    {
+        public required string Id { get; init; }
+
+        public required string SessionId { get; init; }
+
+        public required string ParticipantId { get; init; }
+
+        public required string Source { get; init; }
+
+        public required string ExternalUpdateId { get; init; }
+
+        public long SourceSequence { get; init; }
+
+        public required string ExternalUserId { get; init; }
+
+        public required string Text { get; init; }
+
+        public required string CreatedAt { get; init; }
+    }
+
+    private sealed class ConversationSummaryRow
+    {
+        public required string SessionId { get; init; }
+
+        public long Version { get; init; }
+
+        public long CompactedThroughSequence { get; init; }
+
+        public required string PrivateContextFromParticipantA { get; init; }
+
+        public required string PrivateContextFromParticipantB { get; init; }
+
+        public required string SharedContextAndAgreements { get; init; }
+
+        public required string BoundariesAndSafety { get; init; }
+
+        public required string UpdatedAt { get; init; }
+    }
+
     private sealed class MessageRow
     {
+        public long Sequence { get; init; }
+
         public required string Id { get; init; }
 
         public required string SessionId { get; init; }

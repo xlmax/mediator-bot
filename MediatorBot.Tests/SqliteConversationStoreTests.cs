@@ -214,6 +214,39 @@ public sealed class SqliteConversationStoreTests
     }
 
     [Fact]
+    public async Task PendingTurn_RegistrationIsAtomicAndSurvivesRestartUntilCompleted()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, _) = CreateSession();
+        var firstStore = database.CreateStore();
+        await firstStore.CreateSessionAsync(session);
+        var turn = new PendingExternalTurn(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            "telegram",
+            "42",
+            42,
+            "10001",
+            "Сохранённый turn",
+            DateTimeOffset.UtcNow);
+
+        Assert.True(await firstStore.TryEnqueueAsync(turn));
+        Assert.False(await firstStore.TryEnqueueAsync(turn with { Id = Guid.NewGuid() }));
+
+        var restartedStore = database.CreateStore();
+        var restored = Assert.Single(await restartedStore.GetPendingAsync(session.Id));
+        Assert.Equal(turn, restored);
+
+        await restartedStore.CompleteAsync(session.Id, turn.Id);
+        Assert.Empty(await database.CreateStore().GetPendingAsync(session.Id));
+        Assert.False(await database.CreateStore().TryRegisterAsync(
+            "telegram",
+            session.Id,
+            "42"));
+    }
+
+    [Fact]
     public async Task ParticipantIdentityBindings_PersistAndRejectChangedMapping()
     {
         using var database = new TemporaryDatabase();
@@ -240,6 +273,92 @@ public sealed class SqliteConversationStoreTests
                 session.Id,
                 "test",
                 changedBindings));
+    }
+
+    [Fact]
+    public async Task CompactionSnapshotAndDeletion_PersistAcrossStoreRestart()
+    {
+        using var database = new TemporaryDatabase();
+        var store = database.CreateStore();
+        var (session, participantA, _) = CreateSession();
+        await store.CreateSessionAsync(session);
+        var messages = Enumerable.Range(1, 4)
+            .Select(index => Incoming(
+                session,
+                participantA,
+                $"message-{index}",
+                DateTimeOffset.UtcNow.AddSeconds(index)))
+            .ToArray();
+        foreach (var message in messages)
+        {
+            await store.SaveMessageAsync(message);
+        }
+
+        var batch = await store.GetCompactionBatchAsync(
+            session.Id,
+            triggerMessageCount: 4,
+            triggerCharacterCount: 10_000,
+            retainRecentMessageCount: 2,
+            retainRecentCharacterCount: 5_000);
+        Assert.NotNull(batch);
+        var content = new ConversationSummaryContent(
+            "private-a",
+            "private-b",
+            "shared",
+            "safety");
+        await store.CommitCompactionAsync(
+            session.Id,
+            batch.ExpectedSummaryVersion,
+            batch.CompactedThroughSequence,
+            content,
+            DateTimeOffset.UtcNow);
+
+        var restartedStore = database.CreateStore();
+        var restoredSummary = await restartedStore.GetSummaryAsync(session.Id);
+        var restoredHistory = await restartedStore.GetHistoryAsync(session.Id);
+
+        Assert.NotNull(restoredSummary);
+        Assert.Equal(1, restoredSummary.Version);
+        Assert.Equal(content, restoredSummary.Content);
+        Assert.Equal(
+            messages.Skip(2).Select(message => message.Id),
+            restoredHistory.Select(message => message.Id));
+    }
+
+    [Fact]
+    public async Task CompactionVersionConflict_DoesNotDeleteMessages()
+    {
+        using var database = new TemporaryDatabase();
+        var store = database.CreateStore();
+        var (session, participantA, _) = CreateSession();
+        await store.CreateSessionAsync(session);
+        foreach (var index in Enumerable.Range(1, 4))
+        {
+            await store.SaveMessageAsync(Incoming(
+                session,
+                participantA,
+                $"message-{index}",
+                DateTimeOffset.UtcNow.AddSeconds(index)));
+        }
+
+        var batch = await store.GetCompactionBatchAsync(
+            session.Id,
+            4,
+            10_000,
+            2,
+            5_000);
+        Assert.NotNull(batch);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.CommitCompactionAsync(
+                session.Id,
+                expectedSummaryVersion: 1,
+                batch.CompactedThroughSequence,
+                new ConversationSummaryContent("", "", "", ""),
+                DateTimeOffset.UtcNow));
+
+        Assert.Equal(4, (await store.GetHistoryAsync(session.Id)).Count);
+        Assert.Null(await store.GetSummaryAsync(session.Id));
     }
 
     [Fact]

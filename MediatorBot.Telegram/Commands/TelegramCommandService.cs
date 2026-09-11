@@ -7,6 +7,7 @@ public sealed record TelegramCommandResponse(bool IsAuthorized, string Text);
 public sealed class TelegramCommandService(
     TelegramParticipantRegistry participantRegistry,
     IConversationStore conversationStore,
+    IConversationCompactionStore compactionStore,
     TelegramAdapterOptions options)
 {
     public async Task<TelegramCommandResponse> GetStartAsync(
@@ -27,7 +28,9 @@ public sealed class TelegramCommandService(
         return new TelegramCommandResponse(
             true,
             $"Вы подключены к активной mediator session как {role} " +
-            $"({binding.Participant.DisplayName}). Сообщения второго участника остаются приватными.");
+            $"({binding.Participant.DisplayName}). Сообщения второго участника остаются приватными. " +
+            "В продолжительных диалогах важное сохраняется в краткой памяти медиатора, " +
+            "а старые подробные сообщения после успешного сжатия удаляются.");
     }
 
     public async Task<TelegramCommandResponse> GetStatusAsync(
@@ -42,13 +45,23 @@ public sealed class TelegramCommandService(
             return UnknownUser();
         }
 
-        var history = await conversationStore.GetHistoryAsync(
+        var historyTask = conversationStore.GetHistoryAsync(
             binding.Session.Id,
             cancellationToken: cancellationToken);
+        var summaryTask = compactionStore.GetSummaryAsync(
+            binding.Session.Id,
+            cancellationToken);
+        await Task.WhenAll(historyTask, summaryTask);
+        var history = await historyTask;
+        var summary = await summaryTask;
+        var memoryStatus = summary is null
+            ? "краткая память пока не создавалась"
+            : $"краткая память обновлена " +
+              $"{summary.UpdatedAt.ToUniversalTime():yyyy-MM-dd HH:mm} UTC";
         return new TelegramCommandResponse(
             true,
             $"Session активна. Модель: {options.ModelDisplayName}. " +
-            $"Сообщений в общей истории: {history.Count}.");
+            $"Свежих сообщений в общей истории: {history.Count}; {memoryStatus}.");
     }
 
     public async Task<TelegramCommandResponse> GetHelpAsync(
@@ -67,7 +80,8 @@ public sealed class TelegramCommandService(
             true,
             "Это приватный посредник для общения о взаимоотношениях двух участников. " +
             "Напишите сообщение в личном чате, и медиатор решит, кому и как ответить. " +
-            "Команды: /start, /status, /help.");
+            "При длительном общении бот сохраняет важное в краткой памяти и удаляет " +
+            "успешно сжатые старые подробности. Команды: /start, /status, /help.");
     }
 
     private static TelegramCommandResponse UnknownUser() => new(

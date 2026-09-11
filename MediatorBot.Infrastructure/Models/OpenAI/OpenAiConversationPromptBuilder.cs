@@ -78,6 +78,8 @@ public sealed class OpenAiConversationPromptBuilder
         AppendParticipant(builder, "Participant A", context.ParticipantA);
         AppendParticipant(builder, "Participant B", context.ParticipantB);
         builder.AppendLine();
+        AppendDurableMemory(builder, context.Summary);
+        builder.AppendLine();
         AppendOpenMediatedRequests(builder, context);
         builder.AppendLine();
         builder.AppendLine("Предыдущая единая хронологическая история:");
@@ -107,6 +109,38 @@ public sealed class OpenAiConversationPromptBuilder
         builder.AppendLine("Выбери адресованное действие через один из инструментов.");
 
         return builder.ToString();
+    }
+
+    private static void AppendDurableMemory(
+        StringBuilder builder,
+        ConversationSummary? summary)
+    {
+        builder.AppendLine("DURABLE MEDIATOR MEMORY:");
+        builder.AppendLine(
+            "Это внутренняя сжатая память медиатора. Она может содержать приватную " +
+            "информацию и сама по себе не даёт разрешения раскрывать её участникам.");
+        if (summary is null)
+        {
+            builder.AppendLine("(сжатой памяти пока нет)");
+            return;
+        }
+
+        builder.AppendLine("PRIVATE CONTEXT FROM PARTICIPANT A:");
+        builder.AppendLine(JsonSerializer.Serialize(
+            summary.Content.PrivateContextFromParticipantA,
+            JsonOptions));
+        builder.AppendLine("PRIVATE CONTEXT FROM PARTICIPANT B:");
+        builder.AppendLine(JsonSerializer.Serialize(
+            summary.Content.PrivateContextFromParticipantB,
+            JsonOptions));
+        builder.AppendLine("SHARED CONTEXT AND AGREEMENTS:");
+        builder.AppendLine(JsonSerializer.Serialize(
+            summary.Content.SharedContextAndAgreements,
+            JsonOptions));
+        builder.AppendLine("BOUNDARIES AND SAFETY:");
+        builder.AppendLine(JsonSerializer.Serialize(
+            summary.Content.BoundariesAndSafety,
+            JsonOptions));
     }
 
     private static void AppendOpenMediatedRequests(

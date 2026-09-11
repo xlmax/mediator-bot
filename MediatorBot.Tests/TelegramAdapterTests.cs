@@ -185,6 +185,7 @@ public sealed class TelegramAdapterTests
         var commands = new TelegramCommandService(
             fixture.Registry,
             fixture.Store,
+            fixture.Store,
             fixture.Options);
 
         var responses = new[]
@@ -442,6 +443,67 @@ public sealed class TelegramAdapterTests
     }
 
     [Fact]
+    public async Task MessageWaitingForCompaction_IsNotifiedThenUsesCompactedContext()
+    {
+        var runtime = new RecordingModelRuntime();
+        var summaryGenerator = new BlockingSummaryGenerator();
+        var compactionOptions = new ConversationCompactionOptions
+        {
+            Enabled = true,
+            TriggerMessageCount = 4,
+            TriggerHistoryCharacters = 10_000,
+            RetainRecentMessageCount = 2,
+            RetainRecentCharacters = 5_000,
+            MaxSummaryCharacters = 500,
+            MaxOutputTokens = 100,
+            OperationTimeout = TimeSpan.FromSeconds(5),
+            RetryDelay = TimeSpan.FromSeconds(1)
+        };
+        var fixture = CreateFixture(
+            runtime,
+            compactionOptions: compactionOptions,
+            summaryGenerator: summaryGenerator);
+        var oldBaseTime = DateTimeOffset.UtcNow.AddMinutes(-1);
+        foreach (var index in Enumerable.Range(1, 4))
+        {
+            await fixture.Store.SaveMessageAsync(new Message(
+                Guid.NewGuid(),
+                fixture.Session.Id,
+                fixture.Session.ParticipantA.Id,
+                null,
+                MessageDirection.ParticipantToMediator,
+                $"old-{index}",
+                oldBaseTime.AddSeconds(index)));
+        }
+
+        var processing = fixture.Processor.ProcessPrivateTextAsync(
+            29,
+            ParticipantAUserId,
+            "Новое после сжатия");
+        await summaryGenerator.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Contains(fixture.Transport.Deliveries, delivery =>
+            delivery.Text.Contains("отвечу чуть позже", StringComparison.Ordinal));
+
+        summaryGenerator.Release.TrySetResult();
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Processed,
+            await processing.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        var context = Assert.Single(runtime.Contexts);
+        Assert.NotNull(context.Summary);
+        Assert.Equal("private-a", context.Summary.Content.PrivateContextFromParticipantA);
+        Assert.Equal(
+            ["old-3", "old-4", "Новое после сжатия"],
+            context.History.Select(message => message.Text));
+        Assert.Equal(2, fixture.Transport.Deliveries.Count);
+        Assert.Contains(fixture.Transport.Deliveries, delivery =>
+            delivery.Text == "Готово, продолжаю с вашим сообщением.");
+        Assert.DoesNotContain(
+            await fixture.Store.GetHistoryAsync(fixture.Session.Id),
+            message => message.Text.Contains("накопившийся контекст", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ConcurrentMessagesInSameSession_AreSerializedThroughDelivery()
     {
         var runtime = new DelayedFirstTurnModelRuntime();
@@ -633,7 +695,9 @@ public sealed class TelegramAdapterTests
         IModelRuntime? runtime = null,
         TimeSpan? deliveryTimeout = null,
         TimeSpan? deliveryRecordingTimeout = null,
-        IMediatorDeliveryRecorder? deliveryRecorder = null)
+        IMediatorDeliveryRecorder? deliveryRecorder = null,
+        ConversationCompactionOptions? compactionOptions = null,
+        IConversationSummaryGenerator? summaryGenerator = null)
     {
         var participantA = new Participant(Guid.NewGuid(), "A");
         var participantB = new Participant(Guid.NewGuid(), "B");
@@ -664,13 +728,35 @@ public sealed class TelegramAdapterTests
             store,
             modelRuntime,
             new ConversationContextBuilder(store, store, 100));
-        var processor = new TelegramMessageProcessor(
+        var effectiveCompactionOptions = compactionOptions ??
+            new ConversationCompactionOptions
+            {
+                Enabled = false
+            };
+        var compactionService = new ConversationCompactionService(
+            store,
+            store,
+            summaryGenerator ?? new DisabledConversationSummaryGenerator(),
+            effectiveCompactionOptions);
+        var queuedTurnProcessor = new TelegramQueuedTurnProcessor(
             registry,
             mediationService,
             dispatcher,
-            new SessionTurnCoordinator(),
-            store,
             options,
+            NullLogger<TelegramQueuedTurnProcessor>.Instance);
+        var workQueue = new TelegramSessionWorkQueue(
+            new SessionTurnCoordinator(),
+            compactionService,
+            store,
+            queuedTurnProcessor,
+            transport,
+            options,
+            effectiveCompactionOptions,
+            NullLogger<TelegramSessionWorkQueue>.Instance);
+        var processor = new TelegramMessageProcessor(
+            registry,
+            store,
+            workQueue,
             NullLogger<TelegramMessageProcessor>.Instance);
 
         return new TelegramFixture(
@@ -784,6 +870,31 @@ public sealed class TelegramAdapterTests
                         "Для B",
                         DisclosureDecision.MediatorDisclosure)
                 ]));
+    }
+
+    private sealed class BlockingSummaryGenerator : IConversationSummaryGenerator
+    {
+        public TaskCompletionSource Entered { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<ConversationSummaryContent> GenerateAsync(
+            Session session,
+            ConversationSummaryContent? previousSummary,
+            IReadOnlyList<SequencedMessage> messages,
+            int maxSummaryCharacters,
+            CancellationToken cancellationToken = default)
+        {
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(cancellationToken);
+            return new ConversationSummaryContent(
+                "private-a",
+                "",
+                "",
+                "");
+        }
     }
 
     private sealed class HangingDeliveryRecorder : IMediatorDeliveryRecorder

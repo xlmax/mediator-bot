@@ -6,17 +6,22 @@ public sealed class InMemoryConversationStore :
     IConversationStore,
     IParticipantIdentityStore,
     IExternalUpdateStore,
-    IMediatedRequestStore
+    IExternalTurnQueueStore,
+    IMediatedRequestStore,
+    IConversationCompactionStore
 {
     private readonly Lock _lock = new();
     private readonly Dictionary<Guid, Session> _sessions = [];
-    private readonly Dictionary<Guid, List<Message>> _messagesBySession = [];
+    private readonly Dictionary<Guid, List<SequencedMessage>> _messagesBySession = [];
     private readonly Dictionary<
         (string Provider, string ExternalId),
         (Guid SessionId, Guid ParticipantId)> _identityBindings = [];
     private readonly HashSet<
         (string Source, Guid SessionId, string ExternalUpdateId)> _externalUpdates = [];
     private readonly Dictionary<Guid, MediatedRequest> _mediatedRequests = [];
+    private readonly Dictionary<Guid, PendingExternalTurn> _pendingTurns = [];
+    private readonly Dictionary<Guid, ConversationSummary> _conversationSummaries = [];
+    private long _nextMessageSequence;
 
     public InMemoryConversationStore(IEnumerable<Session>? sessions = null)
     {
@@ -77,7 +82,8 @@ public sealed class InMemoryConversationStore :
             }
 
             ValidateParticipants(session, message);
-            _messagesBySession[message.SessionId].Add(message);
+            _messagesBySession[message.SessionId].Add(
+                new SequencedMessage(++_nextMessageSequence, message));
         }
 
         return Task.CompletedTask;
@@ -328,13 +334,235 @@ public sealed class InMemoryConversationStore :
                 throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
             }
 
-            IEnumerable<Message> history = messages.OrderBy(message => message.CreatedAt);
+            IEnumerable<Message> history = messages
+                .OrderBy(entry => entry.Message.CreatedAt)
+                .ThenBy(entry => entry.Sequence)
+                .Select(entry => entry.Message);
             if (maxMessages is not null)
             {
                 history = history.TakeLast(maxMessages.Value);
             }
 
             return Task.FromResult<IReadOnlyList<Message>>(history.ToArray());
+        }
+    }
+
+    public Task<bool> TryEnqueueAsync(
+        PendingExternalTurn turn,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(turn);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.Source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.ExternalUpdateId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.ExternalUserId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(turn.Text);
+        ArgumentOutOfRangeException.ThrowIfNegative(turn.SourceSequence);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            var session = _sessions.GetValueOrDefault(turn.SessionId)
+                ?? throw new KeyNotFoundException(
+                    $"Session '{turn.SessionId}' was not found.");
+            session.GetParticipant(turn.ParticipantId);
+            if (!_externalUpdates.Add(
+                    (turn.Source, turn.SessionId, turn.ExternalUpdateId)))
+            {
+                return Task.FromResult(false);
+            }
+
+            if (!_pendingTurns.TryAdd(turn.Id, turn))
+            {
+                _externalUpdates.Remove(
+                    (turn.Source, turn.SessionId, turn.ExternalUpdateId));
+                throw new InvalidOperationException(
+                    $"Pending turn '{turn.Id}' already exists.");
+            }
+
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<IReadOnlyList<PendingExternalTurn>> GetPendingAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            EnsureSessionExists(sessionId);
+            return Task.FromResult<IReadOnlyList<PendingExternalTurn>>(
+                _pendingTurns.Values
+                    .Where(turn => turn.SessionId == sessionId)
+                    .OrderBy(turn => turn.SourceSequence)
+                    .ThenBy(turn => turn.CreatedAt)
+                    .ThenBy(turn => turn.Id)
+                    .ToArray());
+        }
+    }
+
+    public Task CompleteAsync(
+        Guid sessionId,
+        Guid turnId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            EnsureSessionExists(sessionId);
+            if (!_pendingTurns.TryGetValue(turnId, out var turn) ||
+                turn.SessionId != sessionId)
+            {
+                throw new KeyNotFoundException(
+                    $"Pending turn '{turnId}' was not found in session '{sessionId}'.");
+            }
+
+            _pendingTurns.Remove(turnId);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<ConversationSummary?> GetSummaryAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            EnsureSessionExists(sessionId);
+            return Task.FromResult(_conversationSummaries.GetValueOrDefault(sessionId));
+        }
+    }
+
+    public Task<ConversationCompactionBatch?> GetCompactionBatchAsync(
+        Guid sessionId,
+        int triggerMessageCount,
+        int triggerCharacterCount,
+        int retainRecentMessageCount,
+        int retainRecentCharacterCount,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateCompactionThresholds(
+            triggerMessageCount,
+            triggerCharacterCount,
+            retainRecentMessageCount,
+            retainRecentCharacterCount);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            EnsureSessionExists(sessionId);
+            var messages = _messagesBySession[sessionId]
+                .OrderBy(entry => entry.Sequence)
+                .ToArray();
+            if (messages.Length < triggerMessageCount &&
+                messages.Sum(entry => entry.Message.Text.Length) < triggerCharacterCount)
+            {
+                return Task.FromResult<ConversationCompactionBatch?>(null);
+            }
+
+            var retainedCount = 0;
+            var retainedCharacters = 0;
+            for (var index = messages.Length - 1; index >= 0; index--)
+            {
+                var messageCharacters = messages[index].Message.Text.Length;
+                if (retainedCount >= retainRecentMessageCount ||
+                    (retainedCount > 0 &&
+                     retainedCharacters + messageCharacters > retainRecentCharacterCount))
+                {
+                    break;
+                }
+
+                retainedCount++;
+                retainedCharacters += messageCharacters;
+            }
+
+            var compactedCount = messages.Length - retainedCount;
+            if (compactedCount <= 0)
+            {
+                return Task.FromResult<ConversationCompactionBatch?>(null);
+            }
+
+            var compactedMessages = messages.Take(compactedCount).ToArray();
+            var previousSummary = _conversationSummaries.GetValueOrDefault(sessionId);
+            return Task.FromResult<ConversationCompactionBatch?>(new(
+                sessionId,
+                previousSummary?.Version ?? 0,
+                compactedMessages[^1].Sequence,
+                previousSummary?.Content,
+                compactedMessages));
+        }
+    }
+
+    public Task CommitCompactionAsync(
+        Guid sessionId,
+        long expectedSummaryVersion,
+        long compactedThroughSequence,
+        ConversationSummaryContent summary,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(summary);
+        ArgumentOutOfRangeException.ThrowIfNegative(expectedSummaryVersion);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(compactedThroughSequence);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            EnsureSessionExists(sessionId);
+            var currentSummary = _conversationSummaries.GetValueOrDefault(sessionId);
+            if ((currentSummary?.Version ?? 0) != expectedSummaryVersion)
+            {
+                throw new InvalidOperationException(
+                    "Conversation summary changed while compaction was running.");
+            }
+
+            var messages = _messagesBySession[sessionId];
+            var compactedMessageCount = messages.Count(entry =>
+                entry.Sequence <= compactedThroughSequence);
+            if (compactedMessageCount == 0)
+            {
+                throw new InvalidOperationException(
+                    "Compaction cutoff does not contain any conversation messages.");
+            }
+
+            _conversationSummaries[sessionId] = new ConversationSummary(
+                sessionId,
+                expectedSummaryVersion + 1,
+                compactedThroughSequence,
+                summary,
+                updatedAt);
+            messages.RemoveAll(entry => entry.Sequence <= compactedThroughSequence);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void EnsureSessionExists(Guid sessionId)
+    {
+        if (!_sessions.ContainsKey(sessionId))
+        {
+            throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
+        }
+    }
+
+    private static void ValidateCompactionThresholds(
+        int triggerMessageCount,
+        int triggerCharacterCount,
+        int retainRecentMessageCount,
+        int retainRecentCharacterCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(triggerMessageCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(triggerCharacterCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(retainRecentMessageCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(retainRecentCharacterCount);
+        if (retainRecentMessageCount >= triggerMessageCount ||
+            retainRecentCharacterCount >= triggerCharacterCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(retainRecentMessageCount),
+                "Retained history must be below its compaction trigger.");
         }
     }
 

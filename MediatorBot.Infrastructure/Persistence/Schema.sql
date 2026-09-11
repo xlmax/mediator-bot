@@ -35,6 +35,24 @@ CREATE TABLE IF NOT EXISTS ExternalUpdates (
     FOREIGN KEY (SessionId) REFERENCES Sessions (Id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS PendingTurns (
+    Id TEXT NOT NULL PRIMARY KEY,
+    SessionId TEXT NOT NULL,
+    ParticipantId TEXT NOT NULL,
+    Source TEXT NOT NULL,
+    ExternalUpdateId TEXT NOT NULL,
+    SourceSequence INTEGER NOT NULL,
+    ExternalUserId TEXT NOT NULL,
+    Text TEXT NOT NULL,
+    CreatedAt TEXT NOT NULL,
+    FOREIGN KEY (SessionId) REFERENCES Sessions (Id) ON DELETE CASCADE,
+    FOREIGN KEY (SessionId, ParticipantId) REFERENCES Participants (SessionId, Id),
+    UNIQUE (Source, SessionId, ExternalUpdateId)
+);
+
+CREATE INDEX IF NOT EXISTS IX_PendingTurns_SessionId_SourceSequence
+    ON PendingTurns (SessionId, SourceSequence, CreatedAt, Id);
+
 CREATE TABLE IF NOT EXISTS Messages (
     Sequence INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     Id TEXT NOT NULL UNIQUE,
@@ -57,6 +75,18 @@ CREATE TABLE IF NOT EXISTS Messages (
 
 CREATE INDEX IF NOT EXISTS IX_Messages_SessionId_CreatedAt
     ON Messages (SessionId, CreatedAt, Sequence);
+
+CREATE TABLE IF NOT EXISTS ConversationSummaries (
+    SessionId TEXT NOT NULL PRIMARY KEY,
+    Version INTEGER NOT NULL CHECK (Version > 0),
+    CompactedThroughSequence INTEGER NOT NULL CHECK (CompactedThroughSequence > 0),
+    PrivateContextFromParticipantA TEXT NOT NULL,
+    PrivateContextFromParticipantB TEXT NOT NULL,
+    SharedContextAndAgreements TEXT NOT NULL,
+    BoundariesAndSafety TEXT NOT NULL,
+    UpdatedAt TEXT NOT NULL,
+    FOREIGN KEY (SessionId) REFERENCES Sessions (Id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS MediatedRequests (
     Id TEXT NOT NULL PRIMARY KEY,
@@ -89,4 +119,4 @@ CREATE TABLE IF NOT EXISTS MediatedRequests (
 CREATE INDEX IF NOT EXISTS IX_MediatedRequests_SessionId_Status_CreatedAt
     ON MediatedRequests (SessionId, Status, CreatedAt);
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 6;

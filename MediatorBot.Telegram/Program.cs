@@ -50,6 +50,31 @@ var deliveryRecordingTimeoutSeconds = builder.Configuration.GetValue<int?>(
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(deliveryRecordingTimeoutSeconds);
 var modelRuntimeName = builder.Configuration["ModelRuntime"] ?? "Fake";
 var configuredModel = builder.Configuration["OpenAI:Model"] ?? "gpt-4.1-mini";
+var compactionConfigured = builder.Configuration.GetValue<bool?>(
+    "Compaction:Enabled") ?? true;
+var compactionOptions = new ConversationCompactionOptions
+{
+    Enabled = compactionConfigured &&
+        modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase),
+    TriggerMessageCount = GetPositiveInt("Compaction:TriggerMessageCount", 100),
+    TriggerHistoryCharacters = GetPositiveInt(
+        "Compaction:TriggerHistoryCharacters",
+        50_000),
+    RetainRecentMessageCount = GetPositiveInt(
+        "Compaction:RetainRecentMessageCount",
+        40),
+    RetainRecentCharacters = GetPositiveInt(
+        "Compaction:RetainRecentCharacters",
+        20_000),
+    MaxSummaryCharacters = GetPositiveInt(
+        "Compaction:MaxSummaryCharacters",
+        6_000),
+    MaxOutputTokens = GetPositiveInt("Compaction:MaxOutputTokens", 2_000),
+    OperationTimeout = TimeSpan.FromSeconds(
+        GetPositiveInt("Compaction:OperationTimeoutSeconds", 180)),
+    RetryDelay = TimeSpan.FromSeconds(
+        GetPositiveInt("Compaction:RetryDelaySeconds", 60))
+};
 
 builder.Services.AddSingleton(new SqliteConversationStoreOptions(
     Path.GetFullPath(databasePath, Directory.GetCurrentDirectory()),
@@ -61,13 +86,19 @@ builder.Services.AddSingleton<IParticipantIdentityStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IExternalUpdateStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IExternalTurnQueueStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IMediatedRequestStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IConversationCompactionStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton(compactionOptions);
 builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
         services.GetRequiredService<IConversationStore>(),
         services.GetRequiredService<IMediatedRequestStore>(),
-        maxHistoryMessages));
+        maxHistoryMessages,
+        services.GetRequiredService<IConversationCompactionStore>()));
 builder.Services.AddSingleton<IMediatorDeliveryRecorder, MediatorDeliveryRecorder>();
 builder.Services.AddSingleton<ISessionTurnCoordinator, SessionTurnCoordinator>();
 builder.Services.AddSingleton<MediationService>();
@@ -75,6 +106,9 @@ builder.Services.AddSingleton<MediationService>();
 if (modelRuntimeName.Equals("Fake", StringComparison.OrdinalIgnoreCase))
 {
     builder.Services.AddSingleton<IModelRuntime, FakeModelRuntime>();
+    builder.Services.AddSingleton<
+        IConversationSummaryGenerator,
+        DisabledConversationSummaryGenerator>();
 }
 else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
 {
@@ -121,6 +155,9 @@ else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<OpenAiConversationPromptBuilder>();
     builder.Services.AddSingleton<OpenAiToolCallMapper>();
     builder.Services.AddSingleton<IModelRuntime, OpenAiModelRuntime>();
+    builder.Services.AddSingleton<
+        IConversationSummaryGenerator,
+        OpenAiConversationSummaryGenerator>();
 }
 else
 {
@@ -146,6 +183,9 @@ builder.Services.AddSingleton<AllowedParticipantFilter>();
 builder.Services.AddSingleton<TelegramCommandService>();
 builder.Services.AddSingleton<TelegramTextChunker>();
 builder.Services.AddSingleton<TelegramMediatorActionDispatcher>();
+builder.Services.AddSingleton<IConversationCompactionService, ConversationCompactionService>();
+builder.Services.AddSingleton<ITelegramQueuedTurnProcessor, TelegramQueuedTurnProcessor>();
+builder.Services.AddSingleton<TelegramSessionWorkQueue>();
 builder.Services.AddSingleton<TelegramMessageProcessor>();
 builder.Services.AddSingleton<ITelegramMessageTransport, TeleFlowMessageTransport>();
 
@@ -169,5 +209,12 @@ string RequireConfiguration(string key)
         throw new InvalidOperationException($"Configuration value '{key}' is required.");
     }
 
+    return value;
+}
+
+int GetPositiveInt(string key, int defaultValue)
+{
+    var value = builder.Configuration.GetValue<int?>(key) ?? defaultValue;
+    ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, key);
     return value;
 }
