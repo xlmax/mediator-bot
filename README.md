@@ -28,6 +28,7 @@ MediatorBot — экспериментальный приватный посре
 | `MediatorBot.Infrastructure` | SQLCipher/SQLite persistence, Fake runtime и OpenAI-compatible runtime. |
 | `MediatorBot.Telegram` | Telegram UI и composition root на базе TeleFlow. |
 | `MediatorBot.Console` | Консольный стенд для локальной проверки mediation flow. |
+| `MediatorBot.BehaviorScenarios` | Live-harness фиксированных disclosure-сценариев с Markdown-transcript. |
 | `MediatorBot.Tests` | Unit- и integration-тесты Core, persistence, OpenAI protocol и Telegram adapter. |
 
 ## Как обрабатывается сообщение
@@ -40,7 +41,11 @@ MediatorBot — экспериментальный приватный посре
 6. Модель должна вызвать ровно один инструмент:
    - `send_to_participant`;
    - `send_to_both`;
+   - `open_mediated_request`;
+   - `resolve_mediated_request`;
+   - `cancel_mediated_request`;
    - `no_action`.
+   Для отправки она также обязана классифицировать решение как `PrivateResponse`, `MediatorDisclosure`, `ExplicitTransfer` или `SafetyDisclosure`; `no_action` получает `NoAction` автоматически.
 7. Длинный ответ без усечения разбивается по Unicode-безопасным границам на части до 4000 символов.
 8. Части последовательно доставляются в Telegram и записываются в историю только после успешной доставки.
 
@@ -245,6 +250,71 @@ dotnet run --project MediatorBot.Console -- --session <SessionId>
 
 Команда `exit` завершает работу.
 
+## Персистентные посреднические запросы
+
+Если участник просит что-либо уточнить у партнёра, модель может открыть `open_mediated_request`. Запрос сохраняется в SQLCipher отдельно от ограниченного окна истории и проходит состояния:
+
+```text
+PendingDelivery → AwaitingResponse → Answered / Declined / NoShareableAnswer / Cancelled
+```
+
+Адресат получает безопасно переформулированный вопрос с явным правом отказаться, а инициатор — подтверждение, что ответ зависит от согласия адресата. Последующее сообщение адресата обрабатывается в новом Telegram turn. Содержательный разрешённый ответ закрывает запрос через `Answered`; отказ или приватная реакция закрывают ожидание инициатора нейтральным сообщением без пересказа формулировки и настроения адресата.
+
+Это event-driven workflow: обработчик и session lock не удерживаются во время ожидания человека. Автоматическое завершение по таймауту пока не реализовано.
+
+## Behavioural disclosure scenarios
+
+`MediatorBot.BehaviorScenarios` прогоняет восемь изолированных синтетических сценариев: прямой и косвенный запросы на утечку, эмоциональное состояние, враждебную и конструктивную передачу, использование общего знания, safety-конфликт версий и закрытие посреднического запроса после отказа.
+
+Пример запуска через environment variables в PowerShell:
+
+```powershell
+$env:OpenAI__ApiKey = "ключ-провайдера"
+$env:OpenAI__Endpoint = "https://openrouter.ai/api/v1"
+$env:OpenAI__Model = "идентификатор-модели"
+dotnet run --project MediatorBot.BehaviorScenarios
+```
+
+Harness не использует рабочую базу и Telegram. Для каждого сценария создаётся отдельный in-memory контекст. Transcript с синтетическими входами, ответами, адресатами и `DisclosureDecision` сохраняется в `artifacts/behavioral/` для ручной оценки. API key и tool arguments в него не записываются. Отдельный сценарий можно запустить так:
+
+```bash
+dotnet run --project MediatorBot.BehaviorScenarios -- --Behavior:ScenarioNumber 8
+```
+
+## Docker Compose
+
+Контейнер собирается multi-stage `Dockerfile`: перед публикацией Telegram host внутри Linux SDK-образа выполняются тесты. Runtime запускается не от root, с read-only filesystem и без опубликованных портов. SQLCipher-база хранится в именованном volume `mediator-bot-data`.
+
+Подготовка конфигурации в WSL/Linux:
+
+```bash
+cp deploy/mediator-bot.env.example deploy/mediator-bot.env
+chmod 600 deploy/mediator-bot.env
+```
+
+Заполните `deploy/mediator-bot.env` реальными значениями. Файл исключён из Git. Перед запуском контейнера остановите другие экземпляры этого Telegram-бота, чтобы два long-polling процесса не читали updates одновременно.
+
+```bash
+docker compose build
+docker compose up -d
+docker compose logs -f --tail=100
+```
+
+Обновление после изменения исходников:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+Остановка без удаления истории:
+
+```bash
+docker compose down
+```
+
+Не используйте `docker compose down -v`, если volume с базой не сохранён отдельно: параметр `-v` удаляет `mediator-bot-data` вместе с историей.
+
 ## Сборка и тесты
 
 ```bash
@@ -268,7 +338,13 @@ dotnet test MediatorBot.slnx
 
 ## Диагностика моделей
 
-Логи различают ошибки провайдера и нарушения модельного протокола.
+Логи различают ошибки провайдера и нарушения модельного протокола. Для успешного действия фиксируется только техническая классификация без текста и tool arguments:
+
+```text
+DisclosureDecision=PrivateResponse
+```
+
+Возможные решения: `PrivateResponse`, `MediatorDisclosure`, `ExplicitTransfer`, `SafetyDisclosure`, `NoAction`.
 
 Для provider failure выводятся только безопасные метаданные:
 
@@ -296,6 +372,7 @@ ProtocolReason=OutputTokenLimit
 - Telegram host рассчитан на одну настроенную session и двух участников.
 - Блокировка turn хранится в памяти процесса и не подходит для нескольких одновременно запущенных экземпляров приложения.
 - Fallback между моделями и distributed lock не реализованы.
+- Открытые посреднические запросы не завершаются автоматически, если адресат вообще не отвечает.
 - Успех зависит от того, насколько выбранная модель соблюдает обязательный tool protocol.
 - Используется alpha-версия TeleFlow, закреплённая в файле проекта.
 - Проект пока предназначен для контролируемого тестирования, а не для production-развёртывания.

@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+.vs/
+.git/
+.gitignore
+**/*.user
+**/appsettings.Development.json
+deploy/*.env
+data/
+artifacts/
+*.db
+*.db-shm
+*.db-wal
+README.md
