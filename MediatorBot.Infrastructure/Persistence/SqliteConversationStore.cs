@@ -6,7 +6,10 @@ using Microsoft.Data.Sqlite;
 
 namespace MediatorBot.Infrastructure;
 
-public sealed class SqliteConversationStore : IConversationStore
+public sealed class SqliteConversationStore :
+    IConversationStore,
+    IParticipantIdentityStore,
+    IExternalUpdateStore
 {
     private const string SchemaResourceName =
         "MediatorBot.Infrastructure.Persistence.Schema.sql";
@@ -164,6 +167,132 @@ public sealed class SqliteConversationStore : IConversationStore
             cancellationToken: cancellationToken));
     }
 
+    public async Task<bool> TryRegisterAsync(
+        string source,
+        Guid sessionId,
+        string externalUpdateId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(externalUpdateId);
+        await EnsureInitializedAsync(cancellationToken);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var affectedRows = await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO ExternalUpdates (
+                Source, SessionId, ExternalUpdateId, RegisteredAt)
+            VALUES (
+                @Source, @SessionId, @ExternalUpdateId, @RegisteredAt)
+            ON CONFLICT (Source, SessionId, ExternalUpdateId) DO NOTHING;
+            """,
+            new
+            {
+                Source = source,
+                SessionId = Format(sessionId),
+                ExternalUpdateId = externalUpdateId,
+                RegisteredAt = Format(DateTimeOffset.UtcNow)
+            },
+            cancellationToken: cancellationToken));
+
+        return affectedRows == 1;
+    }
+
+    public async Task EnsureBindingsAsync(
+        Guid sessionId,
+        string identityProvider,
+        IReadOnlyCollection<ParticipantIdentityBinding> expectedBindings,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(identityProvider);
+        ArgumentNullException.ThrowIfNull(expectedBindings);
+        ValidateExpectedBindings(expectedBindings);
+        await EnsureInitializedAsync(cancellationToken);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var existingBindings = (await connection.QueryAsync<IdentityBindingRow>(
+            new CommandDefinition(
+                """
+                SELECT ExternalId, ParticipantId
+                FROM ParticipantIdentityBindings
+                WHERE IdentityProvider = @IdentityProvider
+                  AND SessionId = @SessionId;
+                """,
+                new
+                {
+                    IdentityProvider = identityProvider,
+                    SessionId = Format(sessionId)
+                },
+                transaction,
+                cancellationToken: cancellationToken))).ToArray();
+
+        if (existingBindings.Length > 0)
+        {
+            var matches = existingBindings.Length == expectedBindings.Count &&
+                expectedBindings.All(expected =>
+                    existingBindings.Any(existing =>
+                        existing.ExternalId == expected.ExternalId &&
+                        existing.ParticipantId == Format(expected.ParticipantId)));
+            if (!matches)
+            {
+                throw new InvalidOperationException(
+                    $"Identity bindings for session '{sessionId}' do not match the configured participants.");
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return;
+        }
+
+        var externalIds = expectedBindings
+            .Select(binding => binding.ExternalId)
+            .ToArray();
+        var conflictingBindingCount = await connection.ExecuteScalarAsync<long>(
+            new CommandDefinition(
+                """
+                SELECT COUNT(*)
+                FROM ParticipantIdentityBindings
+                WHERE IdentityProvider = @IdentityProvider
+                  AND ExternalId IN @ExternalIds;
+                """,
+                new
+                {
+                    IdentityProvider = identityProvider,
+                    ExternalIds = externalIds
+                },
+                transaction,
+                cancellationToken: cancellationToken));
+        if (conflictingBindingCount > 0)
+        {
+            throw new InvalidOperationException(
+                "An external identity is already bound to another participant.");
+        }
+
+        const string insertSql =
+            """
+            INSERT INTO ParticipantIdentityBindings (
+                IdentityProvider, ExternalId, SessionId, ParticipantId)
+            VALUES (
+                @IdentityProvider, @ExternalId, @SessionId, @ParticipantId);
+            """;
+        foreach (var expected in expectedBindings)
+        {
+            await connection.ExecuteAsync(new CommandDefinition(
+                insertSql,
+                new
+                {
+                    IdentityProvider = identityProvider,
+                    expected.ExternalId,
+                    SessionId = Format(sessionId),
+                    ParticipantId = Format(expected.ParticipantId)
+                },
+                transaction,
+                cancellationToken: cancellationToken));
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<IReadOnlyList<Message>> GetHistoryAsync(
         Guid sessionId,
         int? maxMessages = null,
@@ -260,6 +389,26 @@ public sealed class SqliteConversationStore : IConversationStore
         }
     }
 
+    private static void ValidateExpectedBindings(
+        IReadOnlyCollection<ParticipantIdentityBinding> expectedBindings)
+    {
+        if (expectedBindings.Count == 0 ||
+            expectedBindings.Select(binding => binding.ParticipantId).Distinct().Count() !=
+                expectedBindings.Count ||
+            expectedBindings.Select(binding => binding.ExternalId).Distinct().Count() !=
+                expectedBindings.Count)
+        {
+            throw new ArgumentException(
+                "Participant identity bindings must be non-empty and unique.",
+                nameof(expectedBindings));
+        }
+
+        foreach (var binding in expectedBindings)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(binding.ExternalId);
+        }
+    }
+
     private static object ToParticipantParameters(
         Guid sessionId,
         Participant participant,
@@ -323,6 +472,13 @@ public sealed class SqliteConversationStore : IConversationStore
         public required string DisplayName { get; init; }
 
         public int ParticipantOrder { get; init; }
+    }
+
+    private sealed class IdentityBindingRow
+    {
+        public required string ExternalId { get; init; }
+
+        public required string ParticipantId { get; init; }
     }
 
     private sealed class MessageRow

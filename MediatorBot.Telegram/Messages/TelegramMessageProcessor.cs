@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using MediatorBot.Core;
 using MediatorBot.Infrastructure;
 using Microsoft.Extensions.Logging;
@@ -8,6 +9,7 @@ namespace MediatorBot.Telegram;
 public enum TelegramMessageProcessingStatus
 {
     Processed,
+    Duplicate,
     UnknownUser,
     ModelUnavailable,
     ModelProtocolFailure
@@ -18,6 +20,7 @@ public sealed class TelegramMessageProcessor(
     MediationService mediationService,
     TelegramMediatorActionDispatcher actionDispatcher,
     ISessionTurnCoordinator turnCoordinator,
+    IExternalUpdateStore externalUpdateStore,
     TelegramAdapterOptions options,
     ILogger<TelegramMessageProcessor> logger)
 {
@@ -46,6 +49,22 @@ public sealed class TelegramMessageProcessor(
             binding.Session.Id,
             async turnCancellationToken =>
             {
+                var isNewUpdate = await externalUpdateStore.TryRegisterAsync(
+                    "telegram",
+                    binding.Session.Id,
+                    updateId.ToString(CultureInfo.InvariantCulture),
+                    turnCancellationToken);
+                if (!isNewUpdate)
+                {
+                    logger.LogInformation(
+                        "Duplicate Telegram update ignored. UpdateId={UpdateId} " +
+                        "TelegramUserId={TelegramUserId} SessionId={SessionId}",
+                        updateId,
+                        telegramUserId,
+                        binding.Session.Id);
+                    return TelegramMessageProcessingStatus.Duplicate;
+                }
+
                 var turnId = Guid.NewGuid();
                 var startedAt = Stopwatch.GetTimestamp();
                 using var scope = logger.BeginScope(

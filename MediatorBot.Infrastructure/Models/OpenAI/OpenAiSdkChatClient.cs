@@ -1,5 +1,6 @@
 using System.ClientModel;
 using System.ClientModel.Primitives;
+using System.Globalization;
 using System.Text.Json;
 using OpenAI;
 using OpenAI.Chat;
@@ -20,15 +21,19 @@ public sealed class OpenAiSdkChatClient : IOpenAiChatClient
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.MaxOutputTokens);
 
         _model = options.Model;
-        _client = options.Endpoint is null
-            ? new ChatClient(options.Model, options.ApiKey)
-            : new ChatClient(
-                options.Model,
-                new ApiKeyCredential(options.ApiKey),
-                new OpenAIClientOptions
-                {
-                    Endpoint = options.Endpoint
-                });
+        var clientOptions = new OpenAIClientOptions
+        {
+            RetryPolicy = new ClientRetryPolicy(0)
+        };
+        if (options.Endpoint is not null)
+        {
+            clientOptions.Endpoint = options.Endpoint;
+        }
+
+        _client = new ChatClient(
+            options.Model,
+            new ApiKeyCredential(options.ApiKey),
+            clientOptions);
     }
 
     public async Task<OpenAiChatResponse> CompleteAsync(
@@ -85,12 +90,45 @@ public sealed class OpenAiSdkChatClient : IOpenAiChatClient
             throw _responseParser.ParseProviderError(
                 rawResponse.Content,
                 exception.Status,
-                exception);
+                exception,
+                GetRetryAfter(rawResponse));
         }
 
+        var rawResult = result.GetRawResponse();
         return _responseParser.Parse(
-            result.GetRawResponse().Content,
-            _model);
+            rawResult.Content,
+            _model,
+            GetRetryAfter(rawResult));
+    }
+
+    private static TimeSpan? GetRetryAfter(PipelineResponse response)
+    {
+        if (!response.Headers.TryGetValue("Retry-After", out var value))
+        {
+            return null;
+        }
+
+        if (int.TryParse(
+            value,
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var seconds) &&
+            seconds >= 0)
+        {
+            return TimeSpan.FromSeconds(seconds);
+        }
+
+        if (DateTimeOffset.TryParse(
+            value,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal,
+            out var retryAt))
+        {
+            var delay = retryAt - DateTimeOffset.UtcNow;
+            return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
+        }
+
+        return null;
     }
 
     private static JsonElement ParseParameters(string parametersJson)

@@ -17,6 +17,7 @@ public sealed class TelegramAdapterTests
         var sessionId = Guid.NewGuid();
         var registry = new TelegramParticipantRegistry(
             store,
+            store,
             new TelegramAdapterOptions
             {
                 SessionId = sessionId,
@@ -30,6 +31,38 @@ public sealed class TelegramAdapterTests
         var session = await store.GetSessionAsync(sessionId);
         Assert.NotNull(session);
         Assert.NotEqual(session.ParticipantA.Id, session.ParticipantB.Id);
+    }
+
+    [Fact]
+    public async Task Registry_RejectsChangedAccountBindingsForExistingSession()
+    {
+        var store = new InMemoryConversationStore();
+        var sessionId = Guid.NewGuid();
+        var initialRegistry = new TelegramParticipantRegistry(
+            store,
+            store,
+            new TelegramAdapterOptions
+            {
+                SessionId = sessionId,
+                ParticipantAUserId = ParticipantAUserId,
+                ParticipantBUserId = ParticipantBUserId,
+                ModelDisplayName = "Fake"
+            });
+        await initialRegistry.InitializeAsync();
+
+        var changedRegistry = new TelegramParticipantRegistry(
+            store,
+            store,
+            new TelegramAdapterOptions
+            {
+                SessionId = sessionId,
+                ParticipantAUserId = ParticipantBUserId,
+                ParticipantBUserId = ParticipantAUserId,
+                ModelDisplayName = "Fake"
+            });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            changedRegistry.InitializeAsync());
     }
 
     [Fact]
@@ -65,6 +98,29 @@ public sealed class TelegramAdapterTests
         Assert.Empty(runtime.Contexts);
         Assert.Empty(await fixture.Store.GetHistoryAsync(fixture.Session.Id));
         Assert.Empty(fixture.Transport.Deliveries);
+    }
+
+    [Fact]
+    public async Task DuplicateTelegramUpdate_IsIgnoredBeforePersistenceAndModelCall()
+    {
+        var runtime = new RecordingModelRuntime();
+        var fixture = CreateFixture(runtime);
+
+        var firstStatus = await fixture.Processor.ProcessPrivateTextAsync(
+            2,
+            ParticipantAUserId,
+            "Первое получение");
+        var duplicateStatus = await fixture.Processor.ProcessPrivateTextAsync(
+            2,
+            ParticipantAUserId,
+            "Повторная доставка того же update");
+
+        Assert.Equal(TelegramMessageProcessingStatus.Processed, firstStatus);
+        Assert.Equal(TelegramMessageProcessingStatus.Duplicate, duplicateStatus);
+        Assert.Single(runtime.Contexts);
+        var incoming = Assert.Single(
+            await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+        Assert.Equal("Первое получение", incoming.Text);
     }
 
     [Fact]
@@ -224,6 +280,12 @@ public sealed class TelegramAdapterTests
             "Сообщение при недоступном провайдере");
 
         Assert.Equal(TelegramMessageProcessingStatus.ModelUnavailable, status);
+        var duplicateStatus = await fixture.Processor.ProcessPrivateTextAsync(
+            30,
+            ParticipantAUserId,
+            "Повторная доставка после ошибки провайдера");
+
+        Assert.Equal(TelegramMessageProcessingStatus.Duplicate, duplicateStatus);
         Assert.Empty(fixture.Transport.Deliveries);
         var incoming = Assert.Single(
             await fixture.Store.GetHistoryAsync(fixture.Session.Id));
@@ -389,7 +451,7 @@ public sealed class TelegramAdapterTests
             ModelDisplayName = "Fake",
             DeliveryTimeout = deliveryTimeout ?? TimeSpan.FromSeconds(30)
         };
-        var registry = new TelegramParticipantRegistry(store, options);
+        var registry = new TelegramParticipantRegistry(store, store, options);
         var transport = new RecordingTelegramTransport();
         var recorder = new MediatorDeliveryRecorder(store);
         var dispatcher = new TelegramMediatorActionDispatcher(
@@ -408,6 +470,7 @@ public sealed class TelegramAdapterTests
             mediationService,
             dispatcher,
             new SessionTurnCoordinator(),
+            store,
             options,
             NullLogger<TelegramMessageProcessor>.Instance);
 

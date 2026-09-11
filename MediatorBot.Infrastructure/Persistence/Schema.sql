@@ -15,6 +15,26 @@ CREATE TABLE IF NOT EXISTS Participants (
     UNIQUE (SessionId, Id)
 );
 
+CREATE TABLE IF NOT EXISTS ParticipantIdentityBindings (
+    IdentityProvider TEXT NOT NULL,
+    ExternalId TEXT NOT NULL,
+    SessionId TEXT NOT NULL,
+    ParticipantId TEXT NOT NULL,
+    PRIMARY KEY (IdentityProvider, ExternalId),
+    UNIQUE (IdentityProvider, SessionId, ParticipantId),
+    FOREIGN KEY (SessionId) REFERENCES Sessions (Id) ON DELETE CASCADE,
+    FOREIGN KEY (SessionId, ParticipantId) REFERENCES Participants (SessionId, Id)
+);
+
+CREATE TABLE IF NOT EXISTS ExternalUpdates (
+    Source TEXT NOT NULL,
+    SessionId TEXT NOT NULL,
+    ExternalUpdateId TEXT NOT NULL,
+    RegisteredAt TEXT NOT NULL,
+    PRIMARY KEY (Source, SessionId, ExternalUpdateId),
+    FOREIGN KEY (SessionId) REFERENCES Sessions (Id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS Messages (
     Sequence INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     Id TEXT NOT NULL UNIQUE,
@@ -38,4 +58,4 @@ CREATE TABLE IF NOT EXISTS Messages (
 CREATE INDEX IF NOT EXISTS IX_Messages_SessionId_CreatedAt
     ON Messages (SessionId, CreatedAt, Sequence);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;

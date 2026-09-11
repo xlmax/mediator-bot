@@ -7,6 +7,7 @@ public sealed class OpenAiProviderException : Exception
         string? providerErrorType = null,
         string? providerParameter = null,
         string? providerName = null,
+        TimeSpan? retryAfter = null,
         Exception? innerException = null)
         : base("The provider returned an error instead of a chat completion.", innerException)
     {
@@ -14,6 +15,7 @@ public sealed class OpenAiProviderException : Exception
         ProviderErrorType = providerErrorType;
         ProviderParameter = providerParameter;
         ProviderName = providerName;
+        RetryAfter = retryAfter;
     }
 
     public int? ProviderCode { get; }
@@ -23,4 +25,6 @@ public sealed class OpenAiProviderException : Exception
     public string? ProviderParameter { get; }
 
     public string? ProviderName { get; }
+
+    public TimeSpan? RetryAfter { get; }
 }

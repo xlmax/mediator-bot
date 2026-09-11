@@ -4,7 +4,10 @@ namespace MediatorBot.Infrastructure;
 
 public sealed class OpenAiChatResponseParser
 {
-    public OpenAiChatResponse Parse(BinaryData responseData, string requestedModel)
+    public OpenAiChatResponse Parse(
+        BinaryData responseData,
+        string requestedModel,
+        TimeSpan? retryAfter = null)
     {
         ArgumentNullException.ThrowIfNull(responseData);
         ArgumentException.ThrowIfNullOrWhiteSpace(requestedModel);
@@ -15,7 +18,9 @@ public sealed class OpenAiChatResponseParser
             var root = document.RootElement;
             if (root.TryGetProperty("error", out var providerError))
             {
-                throw CreateProviderException(providerError);
+                throw CreateProviderException(
+                    providerError,
+                    retryAfter: retryAfter);
             }
 
             if (!root.TryGetProperty("choices", out var choices) ||
@@ -74,7 +79,8 @@ public sealed class OpenAiChatResponseParser
     public OpenAiProviderException ParseProviderError(
         BinaryData responseData,
         int httpStatus,
-        Exception innerException)
+        Exception innerException,
+        TimeSpan? retryAfter = null)
     {
         ArgumentNullException.ThrowIfNull(responseData);
         ArgumentNullException.ThrowIfNull(innerException);
@@ -86,12 +92,17 @@ public sealed class OpenAiChatResponseParser
             var error = root.TryGetProperty("error", out var providerError)
                 ? providerError
                 : root;
-            return CreateProviderException(error, httpStatus, innerException);
+            return CreateProviderException(
+                error,
+                httpStatus,
+                retryAfter,
+                innerException);
         }
         catch (JsonException)
         {
             return new OpenAiProviderException(
                 httpStatus,
+                retryAfter: retryAfter,
                 innerException: innerException);
         }
     }
@@ -99,6 +110,7 @@ public sealed class OpenAiChatResponseParser
     private static OpenAiProviderException CreateProviderException(
         JsonElement error,
         int? fallbackCode = null,
+        TimeSpan? retryAfter = null,
         Exception? innerException = null) =>
         new(
             TryGetProviderCode(error) ?? fallbackCode,
@@ -107,6 +119,7 @@ public sealed class OpenAiChatResponseParser
             TryGetProviderMetadata(error, "param") ??
                 TryFindKnownProviderParameter(error),
             TryGetProviderMetadata(error, "provider_name"),
+            retryAfter,
             innerException);
 
     private static IReadOnlyList<OpenAiToolCall> ParseToolCalls(JsonElement message)

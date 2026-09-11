@@ -123,6 +123,57 @@ public sealed class SqliteConversationStoreTests
     }
 
     [Fact]
+    public async Task ExternalUpdateRegistration_PersistsAcrossStoreRestart()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, _, _) = CreateSession();
+        var firstStore = database.CreateStore();
+        await firstStore.CreateSessionAsync(session);
+
+        var firstRegistration = await firstStore.TryRegisterAsync(
+            "test",
+            session.Id,
+            "update-1");
+        var restartedStore = database.CreateStore();
+        var duplicateRegistration = await restartedStore.TryRegisterAsync(
+            "test",
+            session.Id,
+            "update-1");
+
+        Assert.True(firstRegistration);
+        Assert.False(duplicateRegistration);
+    }
+
+    [Fact]
+    public async Task ParticipantIdentityBindings_PersistAndRejectChangedMapping()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, participantB) = CreateSession();
+        var firstStore = database.CreateStore();
+        await firstStore.CreateSessionAsync(session);
+        ParticipantIdentityBinding[] bindings =
+        [
+            new(participantA.Id, "external-a"),
+            new(participantB.Id, "external-b")
+        ];
+        await firstStore.EnsureBindingsAsync(session.Id, "test", bindings);
+
+        var restartedStore = database.CreateStore();
+        await restartedStore.EnsureBindingsAsync(session.Id, "test", bindings);
+
+        ParticipantIdentityBinding[] changedBindings =
+        [
+            new(participantA.Id, "external-b"),
+            new(participantB.Id, "external-a")
+        ];
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            restartedStore.EnsureBindingsAsync(
+                session.Id,
+                "test",
+                changedBindings));
+    }
+
+    [Fact]
     public async Task DatabaseFile_IsEncryptedAndCannotBeOpenedWithoutKey()
     {
         using var database = new TemporaryDatabase();

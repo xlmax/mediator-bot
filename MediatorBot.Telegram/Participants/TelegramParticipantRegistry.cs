@@ -1,3 +1,4 @@
+using System.Globalization;
 using MediatorBot.Core;
 
 namespace MediatorBot.Telegram;
@@ -9,8 +10,10 @@ public sealed record TelegramParticipantBinding(
 
 public sealed class TelegramParticipantRegistry(
     IConversationStore conversationStore,
+    IParticipantIdentityStore participantIdentityStore,
     TelegramAdapterOptions options)
 {
+    private const string IdentityProvider = "telegram";
     private readonly SemaphoreSlim _initializationLock = new(1, 1);
     private Session? _session;
 
@@ -41,6 +44,19 @@ public sealed class TelegramParticipantRegistry(
                     new Participant(Guid.NewGuid(), "B"));
                 await conversationStore.CreateSessionAsync(session, cancellationToken);
             }
+
+            await participantIdentityStore.EnsureBindingsAsync(
+                session.Id,
+                IdentityProvider,
+                [
+                    new ParticipantIdentityBinding(
+                        session.ParticipantA.Id,
+                        options.ParticipantAUserId.ToString(CultureInfo.InvariantCulture)),
+                    new ParticipantIdentityBinding(
+                        session.ParticipantB.Id,
+                        options.ParticipantBUserId.ToString(CultureInfo.InvariantCulture))
+                ],
+                cancellationToken);
 
             _session = session;
         }

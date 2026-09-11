@@ -4,6 +4,7 @@ using MediatorBot.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Configuration.Sources.Clear();
@@ -75,15 +76,32 @@ else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
         : new Uri(endpointValue, UriKind.Absolute);
     var maxOutputTokens = builder.Configuration.GetValue<int?>(
         "OpenAI:MaxOutputTokens") ?? 1500;
+    var maxAttempts = builder.Configuration.GetValue<int?>(
+        "OpenAI:MaxAttempts") ?? 3;
+    var requestTimeoutSeconds = builder.Configuration.GetValue<int?>(
+        "OpenAI:RequestTimeoutSeconds") ?? 120;
+    var retryBaseDelayMilliseconds = builder.Configuration.GetValue<int?>(
+        "OpenAI:RetryBaseDelayMilliseconds") ?? 1000;
+    var retryMaxDelaySeconds = builder.Configuration.GetValue<int?>(
+        "OpenAI:RetryMaxDelaySeconds") ?? 30;
 
     builder.Services.AddSingleton(new OpenAiModelRuntimeOptions
     {
         ApiKey = apiKey,
         Model = model,
         Endpoint = endpoint,
-        MaxOutputTokens = maxOutputTokens
+        MaxOutputTokens = maxOutputTokens,
+        MaxAttempts = maxAttempts,
+        RequestTimeout = TimeSpan.FromSeconds(requestTimeoutSeconds),
+        RetryBaseDelay = TimeSpan.FromMilliseconds(retryBaseDelayMilliseconds),
+        RetryMaxDelay = TimeSpan.FromSeconds(retryMaxDelaySeconds)
     });
-    builder.Services.AddSingleton<IOpenAiChatClient, OpenAiSdkChatClient>();
+    builder.Services.AddSingleton<OpenAiSdkChatClient>();
+    builder.Services.AddSingleton<IOpenAiChatClient>(services =>
+        new RetryingOpenAiChatClient(
+            services.GetRequiredService<OpenAiSdkChatClient>(),
+            services.GetRequiredService<OpenAiModelRuntimeOptions>(),
+            services.GetRequiredService<ILogger<RetryingOpenAiChatClient>>()));
     builder.Services.AddSingleton<OpenAiConversationPromptBuilder>();
     builder.Services.AddSingleton<OpenAiToolCallMapper>();
     builder.Services.AddSingleton<IModelRuntime, OpenAiModelRuntime>();
