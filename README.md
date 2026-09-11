@@ -1,5 +1,7 @@
 # MediatorBot
 
+[![CI](https://github.com/xlmax/mediator-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/xlmax/mediator-bot/actions/workflows/ci.yml)
+
 MediatorBot — экспериментальный приватный посредник для общения двух участников. Каждый участник пишет боту в личном Telegram-чате, а модель решает, нужно ли ответить автору, второму участнику или обоим.
 
 Проект является MVP для технического тестирования идеи. Он не заменяет психолога, семейного терапевта или экстренную помощь.
@@ -316,6 +318,8 @@ docker compose down
 Не используйте `docker compose down -v`, если volume с базой не сохранён отдельно: параметр `-v` удаляет `mediator-bot-data` вместе с историей.
 
 ## Сборка и тесты
+
+Публичный GitHub Actions workflow `.github/workflows/ci.yml` на каждый push в `master` и pull request выполняет restore, Release build, весь тестовый набор, проверку Compose и сборку deployment-образа без секретов и без запуска Telegram. Dependabot еженедельно проверяет NuGet, GitHub Actions и Docker base images. Live behavioural scenarios остаются ручными.
 
 ```bash
 dotnet restore
