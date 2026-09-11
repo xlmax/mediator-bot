@@ -8,6 +8,7 @@ MediatorBot — экспериментальный приватный посре
 
 - одна mediator session с двумя заранее разрешёнными Telegram-аккаунтами;
 - приватная обработка сообщений через Telegram long polling;
+- нативный индикатор `typing` на время ожидания и обработки сообщения;
 - Fake runtime для локальной проверки без внешней модели;
 - OpenAI Chat Completions и совместимые API, включая собственный endpoint;
 - обязательный ответ модели через один из tool calls;
@@ -68,7 +69,9 @@ MediatorBot — экспериментальный приватный посре
     "BotToken": "токен-от-BotFather",
     "SessionId": "00000000-0000-0000-0000-000000000000",
     "ParticipantAUserId": 111111111,
-    "ParticipantBUserId": 222222222
+    "ParticipantADisplayName": "Имя A",
+    "ParticipantBUserId": 222222222,
+    "ParticipantBDisplayName": "Имя B"
   }
 }
 ```
@@ -137,7 +140,9 @@ Fake runtime отправляет тестовый ответ автору со�
     "BotToken": "токен-от-BotFather",
     "SessionId": "00000000-0000-0000-0000-000000000000",
     "ParticipantAUserId": 111111111,
-    "ParticipantBUserId": 222222222
+    "ParticipantADisplayName": "Имя A",
+    "ParticipantBUserId": 222222222,
+    "ParticipantBDisplayName": "Имя B"
   }
 }
 ```
@@ -187,7 +192,9 @@ Fake runtime отправляет тестовый ответ автору со�
 | `Telegram:BotToken` | Токен Telegram-бота. |
 | `Telegram:SessionId` | Идентификатор активной session. |
 | `Telegram:ParticipantAUserId` | Telegram UserId первого участника. |
+| `Telegram:ParticipantADisplayName` | Имя, по которому медиатор обращается к первому участнику. |
 | `Telegram:ParticipantBUserId` | Telegram UserId второго участника. |
+| `Telegram:ParticipantBDisplayName` | Имя, по которому медиатор обращается ко второму участнику. |
 | `Telegram:DeliveryTimeoutSeconds` | Timeout доставки сообщения в Telegram. |
 | `Telegram:DeliveryRecordingTimeoutSeconds` | Независимый timeout фиксации успешно доставленного сообщения. |
 

@@ -33,8 +33,12 @@ if (!Guid.TryParse(sessionIdText, out var sessionId) || sessionId == Guid.Empty)
 
 var participantAUserId = builder.Configuration.GetValue<long>(
     "Telegram:ParticipantAUserId");
+var participantADisplayName = builder.Configuration[
+    "Telegram:ParticipantADisplayName"] ?? "A";
 var participantBUserId = builder.Configuration.GetValue<long>(
     "Telegram:ParticipantBUserId");
+var participantBDisplayName = builder.Configuration[
+    "Telegram:ParticipantBDisplayName"] ?? "B";
 var maxHistoryMessages = builder.Configuration.GetValue<int?>(
     "Storage:MaxHistoryMessages") ?? 100;
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHistoryMessages);
@@ -125,7 +129,9 @@ builder.Services.AddSingleton(new TelegramAdapterOptions
 {
     SessionId = sessionId,
     ParticipantAUserId = participantAUserId,
+    ParticipantADisplayName = participantADisplayName,
     ParticipantBUserId = participantBUserId,
+    ParticipantBDisplayName = participantBDisplayName,
     ModelDisplayName = modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase)
         ? configuredModel
         : "Fake",

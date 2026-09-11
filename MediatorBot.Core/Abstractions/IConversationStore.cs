@@ -14,6 +14,11 @@ public interface IConversationStore
         Message message,
         CancellationToken cancellationToken = default);
 
+    Task UpdateParticipantDisplayNamesAsync(
+        Guid sessionId,
+        IReadOnlyDictionary<Guid, string> displayNames,
+        CancellationToken cancellationToken = default);
+
     Task<IReadOnlyList<Message>> GetHistoryAsync(
         Guid sessionId,
         int? maxMessages = null,

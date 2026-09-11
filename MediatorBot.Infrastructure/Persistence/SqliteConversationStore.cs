@@ -167,6 +167,62 @@ public sealed class SqliteConversationStore :
             cancellationToken: cancellationToken));
     }
 
+    public async Task UpdateParticipantDisplayNamesAsync(
+        Guid sessionId,
+        IReadOnlyDictionary<Guid, string> displayNames,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(displayNames);
+        ValidateDisplayNameValues(displayNames);
+        await EnsureInitializedAsync(cancellationToken);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var participantIds = (await connection.QueryAsync<string>(new CommandDefinition(
+            """
+            SELECT Id
+            FROM Participants
+            WHERE SessionId = @SessionId;
+            """,
+            new { SessionId = Format(sessionId) },
+            transaction,
+            cancellationToken: cancellationToken))).ToArray();
+
+        if (participantIds.Length == 0)
+        {
+            throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
+        }
+
+        if (participantIds.Length != displayNames.Count ||
+            displayNames.Keys.Any(participantId =>
+                !participantIds.Contains(Format(participantId), StringComparer.Ordinal)))
+        {
+            throw new ArgumentException(
+                "Display names must be supplied for every session participant.",
+                nameof(displayNames));
+        }
+
+        foreach (var displayName in displayNames)
+        {
+            await connection.ExecuteAsync(new CommandDefinition(
+                """
+                UPDATE Participants
+                SET DisplayName = @DisplayName
+                WHERE SessionId = @SessionId AND Id = @ParticipantId;
+                """,
+                new
+                {
+                    SessionId = Format(sessionId),
+                    ParticipantId = Format(displayName.Key),
+                    DisplayName = displayName.Value
+                },
+                transaction,
+                cancellationToken: cancellationToken));
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     public async Task<bool> TryRegisterAsync(
         string source,
         Guid sessionId,
@@ -386,6 +442,22 @@ public sealed class SqliteConversationStore :
         {
             await connection.DisposeAsync();
             throw;
+        }
+    }
+
+    private static void ValidateDisplayNameValues(
+        IReadOnlyDictionary<Guid, string> displayNames)
+    {
+        if (displayNames.Count == 0)
+        {
+            throw new ArgumentException(
+                "At least one participant display name must be supplied.",
+                nameof(displayNames));
+        }
+
+        foreach (var displayName in displayNames.Values)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(displayName);
         }
     }
 

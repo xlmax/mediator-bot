@@ -123,6 +123,40 @@ public sealed class SqliteConversationStoreTests
     }
 
     [Fact]
+    public async Task ParticipantDisplayNames_CanBeUpdatedWithoutChangingIdentityOrHistory()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, participantB) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        var message = Incoming(
+            session,
+            participantA,
+            "Сообщение до переименования",
+            DateTimeOffset.UtcNow);
+        await store.SaveMessageAsync(message);
+
+        await store.UpdateParticipantDisplayNamesAsync(
+            session.Id,
+            new Dictionary<Guid, string>
+            {
+                [participantA.Id] = "Анна",
+                [participantB.Id] = "Борис"
+            });
+
+        var restartedStore = database.CreateStore();
+        var updatedSession = await restartedStore.GetSessionAsync(session.Id);
+        var history = await restartedStore.GetHistoryAsync(session.Id);
+
+        Assert.NotNull(updatedSession);
+        Assert.Equal(participantA.Id, updatedSession.ParticipantA.Id);
+        Assert.Equal("Анна", updatedSession.ParticipantA.DisplayName);
+        Assert.Equal(participantB.Id, updatedSession.ParticipantB.Id);
+        Assert.Equal("Борис", updatedSession.ParticipantB.DisplayName);
+        Assert.Equal(message.Id, Assert.Single(history).Id);
+    }
+
+    [Fact]
     public async Task ExternalUpdateRegistration_PersistsAcrossStoreRestart()
     {
         using var database = new TemporaryDatabase();

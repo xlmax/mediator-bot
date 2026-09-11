@@ -6,7 +6,11 @@ public sealed class TelegramAdapterOptions
 
     public long ParticipantAUserId { get; init; }
 
+    public string ParticipantADisplayName { get; init; } = "A";
+
     public long ParticipantBUserId { get; init; }
+
+    public string ParticipantBDisplayName { get; init; } = "B";
 
     public required string ModelDisplayName { get; init; }
 

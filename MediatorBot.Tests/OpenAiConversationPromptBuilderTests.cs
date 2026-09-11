@@ -45,7 +45,9 @@ public sealed class OpenAiConversationPromptBuilderTests
         var prompt = new OpenAiConversationPromptBuilder().Build(context);
 
         Assert.Contains($"Participant A: ParticipantId={participantA.Id:D}", prompt);
+        Assert.Contains("DisplayName=\"Алекс\"", prompt);
         Assert.Contains($"Participant B: ParticipantId={participantB.Id:D}", prompt);
+        Assert.Contains("DisplayName=\"Борис\"", prompt);
         Assert.Contains("[Participant B]", prompt);
         Assert.Contains("[Mediator -> Participant B]", prompt);
         Assert.Contains("Дистанция воспринимается болезненно", prompt);
@@ -60,6 +62,7 @@ public sealed class OpenAiConversationPromptBuilderTests
         Assert.Contains("приватные сообщения", OpenAiConversationPromptBuilder.SystemPrompt);
         Assert.Contains("только через предоставленные инструменты", OpenAiConversationPromptBuilder.SystemPrompt);
         Assert.Contains("не видит приватные сообщения другого", OpenAiConversationPromptBuilder.SystemPrompt);
+        Assert.Contains("используй его DisplayName", OpenAiConversationPromptBuilder.SystemPrompt);
     }
 
     private static int CountOccurrences(string value, string search)

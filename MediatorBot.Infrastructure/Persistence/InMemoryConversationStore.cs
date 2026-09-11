@@ -81,6 +81,36 @@ public sealed class InMemoryConversationStore :
         return Task.CompletedTask;
     }
 
+    public Task UpdateParticipantDisplayNamesAsync(
+        Guid sessionId,
+        IReadOnlyDictionary<Guid, string> displayNames,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(displayNames);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session))
+            {
+                throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
+            }
+
+            ValidateDisplayNames(session, displayNames);
+            _sessions[sessionId] = new Session(
+                session.Id,
+                new Participant(
+                    session.ParticipantA.Id,
+                    displayNames[session.ParticipantA.Id]),
+                new Participant(
+                    session.ParticipantB.Id,
+                    displayNames[session.ParticipantB.Id]),
+                session.CreatedAt);
+        }
+
+        return Task.CompletedTask;
+    }
+
     public Task<bool> TryRegisterAsync(
         string source,
         Guid sessionId,
@@ -189,6 +219,25 @@ public sealed class InMemoryConversationStore :
             }
 
             return Task.FromResult<IReadOnlyList<Message>>(history.ToArray());
+        }
+    }
+
+    private static void ValidateDisplayNames(
+        Session session,
+        IReadOnlyDictionary<Guid, string> displayNames)
+    {
+        if (displayNames.Count != 2 ||
+            !displayNames.ContainsKey(session.ParticipantA.Id) ||
+            !displayNames.ContainsKey(session.ParticipantB.Id))
+        {
+            throw new ArgumentException(
+                "Display names must be supplied for both session participants.",
+                nameof(displayNames));
+        }
+
+        foreach (var displayName in displayNames.Values)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(displayName);
         }
     }
 

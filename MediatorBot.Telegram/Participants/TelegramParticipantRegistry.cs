@@ -40,8 +40,8 @@ public sealed class TelegramParticipantRegistry(
             {
                 session = new Session(
                     options.SessionId,
-                    new Participant(Guid.NewGuid(), "A"),
-                    new Participant(Guid.NewGuid(), "B"));
+                    new Participant(Guid.NewGuid(), options.ParticipantADisplayName),
+                    new Participant(Guid.NewGuid(), options.ParticipantBDisplayName));
                 await conversationStore.CreateSessionAsync(session, cancellationToken);
             }
 
@@ -57,6 +57,28 @@ public sealed class TelegramParticipantRegistry(
                         options.ParticipantBUserId.ToString(CultureInfo.InvariantCulture))
                 ],
                 cancellationToken);
+
+            if (session.ParticipantA.DisplayName != options.ParticipantADisplayName ||
+                session.ParticipantB.DisplayName != options.ParticipantBDisplayName)
+            {
+                await conversationStore.UpdateParticipantDisplayNamesAsync(
+                    session.Id,
+                    new Dictionary<Guid, string>
+                    {
+                        [session.ParticipantA.Id] = options.ParticipantADisplayName,
+                        [session.ParticipantB.Id] = options.ParticipantBDisplayName
+                    },
+                    cancellationToken);
+                session = new Session(
+                    session.Id,
+                    new Participant(
+                        session.ParticipantA.Id,
+                        options.ParticipantADisplayName),
+                    new Participant(
+                        session.ParticipantB.Id,
+                        options.ParticipantBDisplayName),
+                    session.CreatedAt);
+            }
 
             _session = session;
         }
@@ -117,6 +139,13 @@ public sealed class TelegramParticipantRegistry(
             throw new InvalidOperationException("Telegram:SessionId must be configured.");
         }
 
+        ValidateDisplayName(
+            options.ParticipantADisplayName,
+            "Telegram:ParticipantADisplayName");
+        ValidateDisplayName(
+            options.ParticipantBDisplayName,
+            "Telegram:ParticipantBDisplayName");
+
         if (options.ParticipantAUserId <= 0 || options.ParticipantBUserId <= 0)
         {
             throw new InvalidOperationException(
@@ -139,6 +168,17 @@ public sealed class TelegramParticipantRegistry(
         {
             throw new InvalidOperationException(
                 "Telegram delivery recording timeout must be positive.");
+        }
+    }
+
+    private static void ValidateDisplayName(string displayName, string configurationKey)
+    {
+        if (string.IsNullOrWhiteSpace(displayName) ||
+            displayName.Length > 100 ||
+            displayName.Any(char.IsControl))
+        {
+            throw new InvalidOperationException(
+                $"{configurationKey} must contain 1-100 characters without control characters.");
         }
     }
 }

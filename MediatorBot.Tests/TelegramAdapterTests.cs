@@ -22,7 +22,9 @@ public sealed class TelegramAdapterTests
             {
                 SessionId = sessionId,
                 ParticipantAUserId = ParticipantAUserId,
+                ParticipantADisplayName = "Анна",
                 ParticipantBUserId = ParticipantBUserId,
+                ParticipantBDisplayName = "Борис",
                 ModelDisplayName = "Fake"
             });
 
@@ -31,6 +33,8 @@ public sealed class TelegramAdapterTests
         var session = await store.GetSessionAsync(sessionId);
         Assert.NotNull(session);
         Assert.NotEqual(session.ParticipantA.Id, session.ParticipantB.Id);
+        Assert.Equal("Анна", session.ParticipantA.DisplayName);
+        Assert.Equal("Борис", session.ParticipantB.DisplayName);
     }
 
     [Fact]
@@ -63,6 +67,57 @@ public sealed class TelegramAdapterTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             changedRegistry.InitializeAsync());
+    }
+
+    [Fact]
+    public async Task Registry_UpdatesDisplayNamesWithoutChangingParticipantIdentity()
+    {
+        var participantA = new Participant(Guid.NewGuid(), "A");
+        var participantB = new Participant(Guid.NewGuid(), "B");
+        var session = new Session(Guid.NewGuid(), participantA, participantB);
+        var store = new InMemoryConversationStore([session]);
+        var registry = new TelegramParticipantRegistry(
+            store,
+            store,
+            new TelegramAdapterOptions
+            {
+                SessionId = session.Id,
+                ParticipantAUserId = ParticipantAUserId,
+                ParticipantADisplayName = "Анна",
+                ParticipantBUserId = ParticipantBUserId,
+                ParticipantBDisplayName = "Борис",
+                ModelDisplayName = "Fake"
+            });
+
+        await registry.InitializeAsync();
+
+        var updatedSession = await store.GetSessionAsync(session.Id);
+        Assert.NotNull(updatedSession);
+        Assert.Equal(participantA.Id, updatedSession.ParticipantA.Id);
+        Assert.Equal("Анна", updatedSession.ParticipantA.DisplayName);
+        Assert.Equal(participantB.Id, updatedSession.ParticipantB.Id);
+        Assert.Equal("Борис", updatedSession.ParticipantB.DisplayName);
+    }
+
+    [Fact]
+    public async Task Registry_RejectsInvalidConfiguredDisplayName()
+    {
+        var store = new InMemoryConversationStore();
+        var registry = new TelegramParticipantRegistry(
+            store,
+            store,
+            new TelegramAdapterOptions
+            {
+                SessionId = Guid.NewGuid(),
+                ParticipantAUserId = ParticipantAUserId,
+                ParticipantADisplayName = new string('а', 101),
+                ParticipantBUserId = ParticipantBUserId,
+                ParticipantBDisplayName = "Борис",
+                ModelDisplayName = "Fake"
+            });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            registry.InitializeAsync());
     }
 
     [Fact]
