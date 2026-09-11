@@ -67,7 +67,7 @@ public sealed class OpenAiModelRuntime : IModelRuntime
             IReadOnlyList<MediatorAction> actions;
             try
             {
-                actions = _toolCallMapper.Map(context.Session, response.ToolCalls);
+                actions = _toolCallMapper.Map(context, response.ToolCalls);
             }
             catch (Exception exception) when (
                 exception is InvalidDataException or
@@ -84,7 +84,8 @@ public sealed class OpenAiModelRuntime : IModelRuntime
                 "OpenAI request completed. SessionId={SessionId} Model={Model} " +
                 "DurationMs={DurationMs:F1} InputTokens={InputTokens} " +
                 "CachedInputTokens={CachedInputTokens} OutputTokens={OutputTokens} " +
-                "ResultType={ResultType} Tools={Tools}",
+                "ResultType={ResultType} Tools={Tools} " +
+                "DisclosureDecisions={DisclosureDecisions}",
                 context.Session.Id,
                 response.Model,
                 Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
@@ -92,7 +93,8 @@ public sealed class OpenAiModelRuntime : IModelRuntime
                 response.Usage.CachedInputTokens,
                 response.Usage.OutputTokens,
                 "ToolCalls",
-                string.Join(',', response.ToolCalls.Select(toolCall => toolCall.Name)));
+                string.Join(',', response.ToolCalls.Select(toolCall => toolCall.Name)),
+                string.Join(',', actions.Select(action => action.DisclosureDecision)));
 
             return new ModelResult(actions);
         }

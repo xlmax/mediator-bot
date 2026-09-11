@@ -63,13 +63,15 @@ public sealed class MediationService
             _logger.LogInformation(
                 "Handled message. SessionId={SessionId} ParticipantId={ParticipantId} " +
                 "MessageId={MessageId} HistoryMessageCount={HistoryMessageCount} " +
-                "DurationMs={DurationMs:F1} ResultTypes={ResultTypes}",
+                "DurationMs={DurationMs:F1} ResultTypes={ResultTypes} " +
+                "DisclosureDecisions={DisclosureDecisions}",
                 sessionId,
                 participantId,
                 incomingMessage.Id,
                 context.History.Count,
                 Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
-                string.Join(',', result.Actions.Select(action => action.GetType().Name)));
+                string.Join(',', result.Actions.Select(action => action.GetType().Name)),
+                string.Join(',', result.Actions.Select(action => action.DisclosureDecision)));
 
             return result.Actions;
         }

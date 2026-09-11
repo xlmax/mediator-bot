@@ -61,9 +61,12 @@ builder.Services.AddSingleton<IParticipantIdentityStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IExternalUpdateStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IMediatedRequestStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
         services.GetRequiredService<IConversationStore>(),
+        services.GetRequiredService<IMediatedRequestStore>(),
         maxHistoryMessages));
 builder.Services.AddSingleton<IMediatorDeliveryRecorder, MediatorDeliveryRecorder>();
 builder.Services.AddSingleton<ISessionTurnCoordinator, SessionTurnCoordinator>();

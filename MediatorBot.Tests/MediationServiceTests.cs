@@ -29,7 +29,12 @@ public sealed class MediationServiceTests
         var (session, participantA, participantB) = CreateSession();
         var store = new InMemoryConversationStore([session]);
         var runtime = new RecordingModelRuntime(context => new ModelResult(
-            [new SendToParticipant(context.Author.Id, $"Ответ для {context.Author.DisplayName}")]));
+            [
+                new SendToParticipant(
+                    context.Author.Id,
+                    $"Ответ для {context.Author.DisplayName}",
+                    DisclosureDecision.PrivateResponse)
+            ]));
         var service = CreateService(store, runtime);
 
         var firstActions = await service.HandleMessageAsync(
@@ -119,7 +124,12 @@ public sealed class MediationServiceTests
         var (session, participantA, participantB) = CreateSession();
         var store = new InMemoryConversationStore([session]);
         var runtime = new RecordingModelRuntime(_ => new ModelResult(
-            [new SendToBoth("Для A", "Для B")]));
+            [
+                new SendToBoth(
+                    "Для A",
+                    "Для B",
+                    DisclosureDecision.MediatorDisclosure)
+            ]));
         var service = CreateService(store, runtime);
 
         var actions = await service.HandleMessageAsync(
@@ -161,7 +171,10 @@ public sealed class MediationServiceTests
         IModelRuntime runtime) => new(
             store,
             runtime,
-            new ConversationContextBuilder(store, 100));
+            new ConversationContextBuilder(
+                store,
+                (IMediatedRequestStore)store,
+                100));
 
     private static (Session Session, Participant ParticipantA, Participant ParticipantB) CreateSession()
     {

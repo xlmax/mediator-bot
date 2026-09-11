@@ -13,7 +13,8 @@ public sealed class FakeModelRuntime : IModelRuntime
 
         MediatorAction action = new SendToParticipant(
             context.Author.Id,
-            $"Получил сообщение от {context.Author.DisplayName}: {context.IncomingMessage.Text}");
+            $"Получил сообщение от {context.Author.DisplayName}: {context.IncomingMessage.Text}",
+            DisclosureDecision.PrivateResponse);
 
         return Task.FromResult(new ModelResult([action]));
     }

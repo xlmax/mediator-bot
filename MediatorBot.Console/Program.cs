@@ -40,9 +40,12 @@ builder.Services.AddSingleton(new SqliteConversationStoreOptions(
 builder.Services.AddSingleton<SqliteConversationStore>();
 builder.Services.AddSingleton<IConversationStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IMediatedRequestStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
         services.GetRequiredService<IConversationStore>(),
+        services.GetRequiredService<IMediatedRequestStore>(),
         maxHistoryMessages));
 
 if (modelRuntimeName.Equals("Fake", StringComparison.OrdinalIgnoreCase))
@@ -134,6 +137,7 @@ System.Console.WriteLine("Вводи сообщения по очереди; 'ex
 
 var mediationService = host.Services.GetRequiredService<MediationService>();
 var deliveryRecorder = host.Services.GetRequiredService<IMediatorDeliveryRecorder>();
+var mediatedRequestStore = host.Services.GetRequiredService<IMediatedRequestStore>();
 var currentParticipant = GetNextParticipant(session, history);
 while (true)
 {
@@ -157,7 +161,11 @@ while (true)
 
     foreach (var action in actions)
     {
-        await DeliverAsync(action, session, deliveryRecorder);
+        await DeliverAsync(
+            action,
+            session,
+            deliveryRecorder,
+            mediatedRequestStore);
     }
 
     currentParticipant = currentParticipant.Id == session.ParticipantA.Id
@@ -204,7 +212,8 @@ static Participant GetNextParticipant(
 static async Task DeliverAsync(
     MediatorAction action,
     Session session,
-    IMediatorDeliveryRecorder deliveryRecorder)
+    IMediatorDeliveryRecorder deliveryRecorder,
+    IMediatedRequestStore mediatedRequestStore)
 {
     switch (action)
     {
@@ -233,8 +242,93 @@ static async Task DeliverAsync(
                 send.TextForParticipantB);
             break;
 
+        case OpenMediatedRequest open:
+            await mediatedRequestStore.CreateAsync(new MediatedRequest(
+                open.RequestId,
+                session.Id,
+                open.RequesterId,
+                open.RespondentId,
+                open.Summary,
+                MediatedRequestStatus.PendingDelivery,
+                DateTimeOffset.UtcNow));
+            await PrintAndRecordAsync(
+                session,
+                open.RespondentId,
+                open.TextForRespondent,
+                deliveryRecorder);
+            await mediatedRequestStore.MarkAwaitingResponseAsync(
+                session.Id,
+                open.RequestId);
+            await PrintAndRecordAsync(
+                session,
+                open.RequesterId,
+                open.TextForRequester,
+                deliveryRecorder);
+            break;
+
+        case ResolveMediatedRequest resolve:
+            await PrintAndRecordAsync(
+                session,
+                resolve.RequesterId,
+                resolve.TextForRequester,
+                deliveryRecorder);
+            await mediatedRequestStore.ResolveAsync(
+                session.Id,
+                resolve.RequestId,
+                resolve.Outcome switch
+                {
+                    MediatedRequestOutcome.Answered => MediatedRequestStatus.Answered,
+                    MediatedRequestOutcome.Declined => MediatedRequestStatus.Declined,
+                    MediatedRequestOutcome.NoShareableAnswer =>
+                        MediatedRequestStatus.NoShareableAnswer,
+                    _ => throw new InvalidOperationException(
+                        $"Unsupported mediated request outcome '{resolve.Outcome}'.")
+                },
+                DateTimeOffset.UtcNow);
+            if (resolve.TextForRespondent is not null)
+            {
+                await PrintAndRecordAsync(
+                    session,
+                    resolve.RespondentId,
+                    resolve.TextForRespondent,
+                    deliveryRecorder);
+            }
+            break;
+
+        case CancelMediatedRequest cancel:
+            await PrintAndRecordAsync(
+                session,
+                cancel.RespondentId,
+                cancel.TextForRespondent,
+                deliveryRecorder);
+            await mediatedRequestStore.ResolveAsync(
+                session.Id,
+                cancel.RequestId,
+                MediatedRequestStatus.Cancelled,
+                DateTimeOffset.UtcNow);
+            await PrintAndRecordAsync(
+                session,
+                cancel.RequesterId,
+                cancel.TextForRequester,
+                deliveryRecorder);
+            break;
+
         case NoAction:
             System.Console.WriteLine("BOT: нет действий");
             break;
     }
+}
+
+static async Task PrintAndRecordAsync(
+    Session session,
+    Guid participantId,
+    string text,
+    IMediatorDeliveryRecorder deliveryRecorder)
+{
+    var recipient = session.GetParticipant(participantId);
+    System.Console.WriteLine($"BOT -> {recipient.DisplayName}: {text}");
+    await deliveryRecorder.RecordDeliveredAsync(
+        session.Id,
+        participantId,
+        text);
 }

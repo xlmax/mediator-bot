@@ -9,7 +9,8 @@ namespace MediatorBot.Infrastructure;
 public sealed class SqliteConversationStore :
     IConversationStore,
     IParticipantIdentityStore,
-    IExternalUpdateStore
+    IExternalUpdateStore,
+    IMediatedRequestStore
 {
     private const string SchemaResourceName =
         "MediatorBot.Infrastructure.Persistence.Schema.sql";
@@ -221,6 +222,117 @@ public sealed class SqliteConversationStore :
         }
 
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task CreateAsync(
+        MediatedRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.Status != MediatedRequestStatus.PendingDelivery ||
+            request.ResolvedAt is not null ||
+            string.IsNullOrWhiteSpace(request.Summary))
+        {
+            throw new ArgumentException(
+                "A new mediated request must be pending delivery with a summary.",
+                nameof(request));
+        }
+
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO MediatedRequests (
+                Id, SessionId, RequesterId, RespondentId, Summary,
+                Status, CreatedAt, ResolvedAt)
+            VALUES (
+                @Id, @SessionId, @RequesterId, @RespondentId, @Summary,
+                @Status, @CreatedAt, NULL);
+            """,
+            new
+            {
+                Id = Format(request.Id),
+                SessionId = Format(request.SessionId),
+                RequesterId = Format(request.RequesterId),
+                RespondentId = Format(request.RespondentId),
+                request.Summary,
+                Status = request.Status.ToString(),
+                CreatedAt = Format(request.CreatedAt)
+            },
+            cancellationToken: cancellationToken));
+    }
+
+    public async Task MarkAwaitingResponseAsync(
+        Guid sessionId,
+        Guid requestId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var affectedRows = await connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE MediatedRequests
+            SET Status = 'AwaitingResponse'
+            WHERE Id = @RequestId
+              AND SessionId = @SessionId
+              AND Status = 'PendingDelivery';
+            """,
+            new
+            {
+                RequestId = Format(requestId),
+                SessionId = Format(sessionId)
+            },
+            cancellationToken: cancellationToken));
+        EnsureSingleTransition(affectedRows, requestId, "PendingDelivery");
+    }
+
+    public async Task ResolveAsync(
+        Guid sessionId,
+        Guid requestId,
+        MediatedRequestStatus status,
+        DateTimeOffset resolvedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFinalStatus(status);
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var affectedRows = await connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE MediatedRequests
+            SET Status = @Status, ResolvedAt = @ResolvedAt
+            WHERE Id = @RequestId
+              AND SessionId = @SessionId
+              AND Status = 'AwaitingResponse';
+            """,
+            new
+            {
+                RequestId = Format(requestId),
+                SessionId = Format(sessionId),
+                Status = status.ToString(),
+                ResolvedAt = Format(resolvedAt)
+            },
+            cancellationToken: cancellationToken));
+        EnsureSingleTransition(affectedRows, requestId, "AwaitingResponse");
+    }
+
+    public async Task<IReadOnlyList<MediatedRequest>> GetOpenAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var rows = await connection.QueryAsync<MediatedRequestRow>(new CommandDefinition(
+            """
+            SELECT Id, SessionId, RequesterId, RespondentId, Summary,
+                   Status, CreatedAt, ResolvedAt
+            FROM MediatedRequests
+            WHERE SessionId = @SessionId
+              AND Status = 'AwaitingResponse'
+            ORDER BY CreatedAt, Id;
+            """,
+            new { SessionId = Format(sessionId) },
+            cancellationToken: cancellationToken));
+        return rows.Select(ToMediatedRequest).ToArray();
     }
 
     public async Task<bool> TryRegisterAsync(
@@ -445,6 +557,33 @@ public sealed class SqliteConversationStore :
         }
     }
 
+    private static void EnsureSingleTransition(
+        int affectedRows,
+        Guid requestId,
+        string expectedStatus)
+    {
+        if (affectedRows != 1)
+        {
+            throw new InvalidOperationException(
+                $"Mediated request '{requestId}' was not in status '{expectedStatus}'.");
+        }
+    }
+
+    private static void ValidateFinalStatus(MediatedRequestStatus status)
+    {
+        if (status is not (
+            MediatedRequestStatus.Answered or
+            MediatedRequestStatus.Declined or
+            MediatedRequestStatus.NoShareableAnswer or
+            MediatedRequestStatus.Cancelled))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(status),
+                status,
+                "A mediated request must resolve to a final status.");
+        }
+    }
+
     private static void ValidateDisplayNameValues(
         IReadOnlyDictionary<Guid, string> displayNames)
     {
@@ -504,6 +643,16 @@ public sealed class SqliteConversationStore :
         row.Text,
         ParseTimestamp(row.CreatedAt));
 
+    private static MediatedRequest ToMediatedRequest(MediatedRequestRow row) => new(
+        Guid.Parse(row.Id),
+        Guid.Parse(row.SessionId),
+        Guid.Parse(row.RequesterId),
+        Guid.Parse(row.RespondentId),
+        row.Summary,
+        Enum.Parse<MediatedRequestStatus>(row.Status),
+        ParseTimestamp(row.CreatedAt),
+        row.ResolvedAt is null ? null : ParseTimestamp(row.ResolvedAt));
+
     private static string Format(Guid value) => value.ToString("D");
 
     private static string? Format(Guid? value) => value?.ToString("D");
@@ -551,6 +700,25 @@ public sealed class SqliteConversationStore :
         public required string ExternalId { get; init; }
 
         public required string ParticipantId { get; init; }
+    }
+
+    private sealed class MediatedRequestRow
+    {
+        public required string Id { get; init; }
+
+        public required string SessionId { get; init; }
+
+        public required string RequesterId { get; init; }
+
+        public required string RespondentId { get; init; }
+
+        public required string Summary { get; init; }
+
+        public required string Status { get; init; }
+
+        public required string CreatedAt { get; init; }
+
+        public string? ResolvedAt { get; init; }
     }
 
     private sealed class MessageRow

@@ -58,4 +58,35 @@ CREATE TABLE IF NOT EXISTS Messages (
 CREATE INDEX IF NOT EXISTS IX_Messages_SessionId_CreatedAt
     ON Messages (SessionId, CreatedAt, Sequence);
 
-PRAGMA user_version = 3;
+CREATE TABLE IF NOT EXISTS MediatedRequests (
+    Id TEXT NOT NULL PRIMARY KEY,
+    SessionId TEXT NOT NULL,
+    RequesterId TEXT NOT NULL,
+    RespondentId TEXT NOT NULL,
+    Summary TEXT NOT NULL,
+    Status TEXT NOT NULL CHECK (
+        Status IN (
+            'PendingDelivery',
+            'AwaitingResponse',
+            'Answered',
+            'Declined',
+            'NoShareableAnswer',
+            'Cancelled')),
+    CreatedAt TEXT NOT NULL,
+    ResolvedAt TEXT NULL,
+    FOREIGN KEY (SessionId) REFERENCES Sessions (Id) ON DELETE CASCADE,
+    FOREIGN KEY (SessionId, RequesterId) REFERENCES Participants (SessionId, Id),
+    FOREIGN KEY (SessionId, RespondentId) REFERENCES Participants (SessionId, Id),
+    CHECK (RequesterId <> RespondentId),
+    CHECK (
+        (Status IN ('PendingDelivery', 'AwaitingResponse') AND ResolvedAt IS NULL)
+        OR
+        (Status IN ('Answered', 'Declined', 'NoShareableAnswer', 'Cancelled')
+            AND ResolvedAt IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS IX_MediatedRequests_SessionId_Status_CreatedAt
+    ON MediatedRequests (SessionId, Status, CreatedAt);
+
+PRAGMA user_version = 4;

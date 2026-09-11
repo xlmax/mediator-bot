@@ -87,7 +87,7 @@ public sealed class SqliteConversationStoreTests
         var firstService = new MediationService(
             firstStore,
             new FakeModelRuntime(),
-            new ConversationContextBuilder(firstStore, 100));
+            new ConversationContextBuilder(firstStore, firstStore, 100));
 
         var firstActions = await firstService.HandleMessageAsync(
             session.Id,
@@ -104,7 +104,7 @@ public sealed class SqliteConversationStoreTests
         var restartedService = new MediationService(
             restartedStore,
             runtime,
-            new ConversationContextBuilder(restartedStore, 100));
+            new ConversationContextBuilder(restartedStore, restartedStore, 100));
         await restartedService.HandleMessageAsync(
             session.Id,
             participantB.Id,
@@ -154,6 +154,41 @@ public sealed class SqliteConversationStoreTests
         Assert.Equal(participantB.Id, updatedSession.ParticipantB.Id);
         Assert.Equal("Борис", updatedSession.ParticipantB.DisplayName);
         Assert.Equal(message.Id, Assert.Single(history).Id);
+    }
+
+    [Fact]
+    public async Task MediatedRequestLifecycle_PersistsAcrossStoreRestart()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, participantB) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        var request = new MediatedRequest(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            participantB.Id,
+            "Уточнить, готов ли B ответить",
+            MediatedRequestStatus.PendingDelivery,
+            DateTimeOffset.UtcNow);
+
+        await store.CreateAsync(request);
+        Assert.Empty(await store.GetOpenAsync(session.Id));
+        await store.MarkAwaitingResponseAsync(session.Id, request.Id);
+
+        var restartedStore = database.CreateStore();
+        var restored = Assert.Single(await restartedStore.GetOpenAsync(session.Id));
+        Assert.Equal(request.Id, restored.Id);
+        Assert.Equal(request.Summary, restored.Summary);
+        Assert.Equal(MediatedRequestStatus.AwaitingResponse, restored.Status);
+
+        await restartedStore.ResolveAsync(
+            session.Id,
+            request.Id,
+            MediatedRequestStatus.Declined,
+            DateTimeOffset.UtcNow);
+
+        Assert.Empty(await database.CreateStore().GetOpenAsync(session.Id));
     }
 
     [Fact]

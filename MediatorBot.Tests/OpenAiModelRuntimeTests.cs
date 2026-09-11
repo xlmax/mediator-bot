@@ -27,10 +27,16 @@ public sealed class OpenAiModelRuntimeTests
             [
                 OpenAiToolCatalog.SendToParticipant,
                 OpenAiToolCatalog.SendToBoth,
+                OpenAiToolCatalog.OpenMediatedRequest,
+                OpenAiToolCatalog.ResolveMediatedRequest,
+                OpenAiToolCatalog.CancelMediatedRequest,
                 OpenAiToolCatalog.NoAction
             ],
             capturedRequest.Tools.Select(tool => tool.Name));
         Assert.Contains("Текущий текст", capturedRequest.ConversationPrompt);
+        Assert.All(
+            capturedRequest.Tools.Where(tool => tool.Name != OpenAiToolCatalog.NoAction),
+            tool => Assert.Contains("\"disclosureDecision\"", tool.ParametersJson));
     }
 
     [Fact]
@@ -77,6 +83,29 @@ public sealed class OpenAiModelRuntimeTests
     }
 
     [Fact]
+    public async Task ProcessAsync_RejectsSendWithoutDisclosureDecision()
+    {
+        var context = CreateContext("Входящее сообщение");
+        var client = new StubChatClient(_ => Response(
+            [
+                new OpenAiToolCall(
+                    OpenAiToolCatalog.SendToParticipant,
+                    $$"""
+                    {
+                      "participantId":"{{context.Author.Id:D}}",
+                      "text":"Ответ"
+                    }
+                    """)
+            ]));
+        var runtime = CreateRuntime(client);
+
+        var exception = await Assert.ThrowsAsync<OpenAiProtocolException>(() =>
+            runtime.ProcessAsync(context));
+
+        Assert.Equal(OpenAiProtocolFailureReason.InvalidToolCall, exception.Reason);
+    }
+
+    [Fact]
     public async Task ProcessAsync_LogsUsageWithoutPrivateText()
     {
         const string privateText = "секретное содержимое разговора";
@@ -95,6 +124,7 @@ public sealed class OpenAiModelRuntimeTests
         Assert.Contains("InputTokens=123", log);
         Assert.Contains("CachedInputTokens=45", log);
         Assert.Contains("OutputTokens=17", log);
+        Assert.Contains("DisclosureDecisions=NoAction", log);
         Assert.DoesNotContain(privateText, log);
     }
 

@@ -5,7 +5,8 @@ namespace MediatorBot.Infrastructure;
 public sealed class InMemoryConversationStore :
     IConversationStore,
     IParticipantIdentityStore,
-    IExternalUpdateStore
+    IExternalUpdateStore,
+    IMediatedRequestStore
 {
     private readonly Lock _lock = new();
     private readonly Dictionary<Guid, Session> _sessions = [];
@@ -15,6 +16,7 @@ public sealed class InMemoryConversationStore :
         (Guid SessionId, Guid ParticipantId)> _identityBindings = [];
     private readonly HashSet<
         (string Source, Guid SessionId, string ExternalUpdateId)> _externalUpdates = [];
+    private readonly Dictionary<Guid, MediatedRequest> _mediatedRequests = [];
 
     public InMemoryConversationStore(IEnumerable<Session>? sessions = null)
     {
@@ -109,6 +111,120 @@ public sealed class InMemoryConversationStore :
         }
 
         return Task.CompletedTask;
+    }
+
+    public Task CreateAsync(
+        MediatedRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(request.SessionId, out var session))
+            {
+                throw new KeyNotFoundException(
+                    $"Session '{request.SessionId}' was not found.");
+            }
+
+            session.GetParticipant(request.RequesterId);
+            session.GetParticipant(request.RespondentId);
+            if (request.RequesterId == request.RespondentId ||
+                request.Status != MediatedRequestStatus.PendingDelivery ||
+                request.ResolvedAt is not null ||
+                string.IsNullOrWhiteSpace(request.Summary))
+            {
+                throw new ArgumentException(
+                    "A new mediated request must be pending delivery and connect two participants.",
+                    nameof(request));
+            }
+
+            if (!_mediatedRequests.TryAdd(request.Id, request))
+            {
+                throw new InvalidOperationException(
+                    $"Mediated request '{request.Id}' already exists.");
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task MarkAwaitingResponseAsync(
+        Guid sessionId,
+        Guid requestId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            var request = GetRequest(sessionId, requestId);
+            if (request.Status != MediatedRequestStatus.PendingDelivery)
+            {
+                throw new InvalidOperationException(
+                    $"Mediated request '{requestId}' is not pending delivery.");
+            }
+
+            _mediatedRequests[requestId] = request with
+            {
+                Status = MediatedRequestStatus.AwaitingResponse
+            };
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task ResolveAsync(
+        Guid sessionId,
+        Guid requestId,
+        MediatedRequestStatus status,
+        DateTimeOffset resolvedAt,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ValidateFinalStatus(status);
+
+        lock (_lock)
+        {
+            var request = GetRequest(sessionId, requestId);
+            if (request.Status != MediatedRequestStatus.AwaitingResponse)
+            {
+                throw new InvalidOperationException(
+                    $"Mediated request '{requestId}' is not awaiting a response.");
+            }
+
+            _mediatedRequests[requestId] = request with
+            {
+                Status = status,
+                ResolvedAt = resolvedAt
+            };
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<MediatedRequest>> GetOpenAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_lock)
+        {
+            if (!_sessions.ContainsKey(sessionId))
+            {
+                throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
+            }
+
+            return Task.FromResult<IReadOnlyList<MediatedRequest>>(
+                _mediatedRequests.Values
+                    .Where(request =>
+                        request.SessionId == sessionId &&
+                        request.Status == MediatedRequestStatus.AwaitingResponse)
+                    .OrderBy(request => request.CreatedAt)
+                    .ToArray());
+        }
     }
 
     public Task<bool> TryRegisterAsync(
@@ -219,6 +335,33 @@ public sealed class InMemoryConversationStore :
             }
 
             return Task.FromResult<IReadOnlyList<Message>>(history.ToArray());
+        }
+    }
+
+    private MediatedRequest GetRequest(Guid sessionId, Guid requestId)
+    {
+        if (!_mediatedRequests.TryGetValue(requestId, out var request) ||
+            request.SessionId != sessionId)
+        {
+            throw new KeyNotFoundException(
+                $"Mediated request '{requestId}' was not found in session '{sessionId}'.");
+        }
+
+        return request;
+    }
+
+    private static void ValidateFinalStatus(MediatedRequestStatus status)
+    {
+        if (status is not (
+            MediatedRequestStatus.Answered or
+            MediatedRequestStatus.Declined or
+            MediatedRequestStatus.NoShareableAnswer or
+            MediatedRequestStatus.Cancelled))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(status),
+                status,
+                "A mediated request must resolve to a final status.");
         }
     }
 

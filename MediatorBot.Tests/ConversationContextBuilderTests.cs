@@ -20,8 +20,18 @@ public sealed class ConversationContextBuilderTests
         await store.SaveMessageAsync(first);
         await store.SaveMessageAsync(mediator);
         await store.SaveMessageAsync(current);
+        var openRequest = new MediatedRequest(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            participantB.Id,
+            "Уточнить готовность к разговору",
+            MediatedRequestStatus.PendingDelivery,
+            start);
+        await store.CreateAsync(openRequest);
+        await store.MarkAwaitingResponseAsync(session.Id, openRequest.Id);
 
-        var builder = new ConversationContextBuilder(store, 2);
+        var builder = new ConversationContextBuilder(store, store, 2);
         var context = await builder.BuildAsync(session, current);
 
         Assert.Equal(participantA, context.ParticipantA);
@@ -29,6 +39,9 @@ public sealed class ConversationContextBuilderTests
         Assert.Equal(participantB, context.Author);
         Assert.Equal(current, context.IncomingMessage);
         Assert.Equal([mediator.Id, current.Id], context.History.Select(message => message.Id));
+        Assert.Equal(
+            openRequest.Id,
+            Assert.Single(context.OpenMediatedRequests).Id);
     }
 
     private static Message Incoming(
