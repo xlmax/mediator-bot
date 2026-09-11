@@ -187,6 +187,34 @@ public sealed class TelegramAdapterTests
     }
 
     [Fact]
+    public async Task LongMediatorMessage_IsDeliveredAndRecordedInLosslessChunks()
+    {
+        var fixture = CreateFixture();
+        var text = new string('д', 8500);
+
+        await fixture.Dispatcher.DispatchAsync(
+            20,
+            ParticipantBUserId,
+            fixture.Session,
+            [new SendToParticipant(fixture.Session.ParticipantA.Id, text)]);
+
+        Assert.Equal(3, fixture.Transport.Deliveries.Count);
+        Assert.All(
+            fixture.Transport.Deliveries,
+            delivery => Assert.InRange(
+                delivery.Text.Length,
+                1,
+                TelegramTextChunker.DefaultMaxChunkLength));
+        Assert.Equal(
+            text,
+            string.Concat(fixture.Transport.Deliveries.Select(delivery => delivery.Text)));
+
+        var history = await fixture.Store.GetHistoryAsync(fixture.Session.Id);
+        Assert.Equal(3, history.Count);
+        Assert.Equal(text, string.Concat(history.Select(message => message.Text)));
+    }
+
+    [Fact]
     public async Task SendToBoth_CreatesTwoSeparateDeliveriesAndHistoryMessages()
     {
         var fixture = CreateFixture();
@@ -388,6 +416,51 @@ public sealed class TelegramAdapterTests
     }
 
     [Fact]
+    public async Task CallerCancellationAfterDelivery_DoesNotPreventHistoryRecording()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var fixture = CreateFixture(new SendToParticipantModelRuntime());
+        fixture.Transport.AfterSuccessfulSend = cancellation.Cancel;
+
+        var status = await fixture.Processor.ProcessPrivateTextAsync(
+            36,
+            ParticipantAUserId,
+            "Turn с отменой после доставки",
+            cancellation.Token);
+
+        Assert.Equal(TelegramMessageProcessingStatus.Processed, status);
+        var history = await fixture.Store.GetHistoryAsync(fixture.Session.Id);
+        Assert.Collection(
+            history,
+            incoming => Assert.Equal(
+                MessageDirection.ParticipantToMediator,
+                incoming.Direction),
+            outgoing => Assert.Equal(
+                MessageDirection.MediatorToParticipant,
+                outgoing.Direction));
+    }
+
+    [Fact]
+    public async Task RecordingTimeout_OccursAfterSuccessfulDelivery()
+    {
+        var fixture = CreateFixture(
+            new SendToParticipantModelRuntime(),
+            deliveryRecordingTimeout: TimeSpan.FromMilliseconds(30),
+            deliveryRecorder: new HangingDeliveryRecorder());
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Processor.ProcessPrivateTextAsync(
+                37,
+                ParticipantAUserId,
+                "Turn с зависшей записью"));
+
+        Assert.Single(fixture.Transport.Deliveries);
+        var incoming = Assert.Single(
+            await fixture.Store.GetHistoryAsync(fixture.Session.Id));
+        Assert.Equal(MessageDirection.ParticipantToMediator, incoming.Direction);
+    }
+
+    [Fact]
     public async Task SessionTurnCoordinator_AllowsDifferentSessionsInParallel()
     {
         var coordinator = new SessionTurnCoordinator();
@@ -437,7 +510,9 @@ public sealed class TelegramAdapterTests
 
     private static TelegramFixture CreateFixture(
         IModelRuntime? runtime = null,
-        TimeSpan? deliveryTimeout = null)
+        TimeSpan? deliveryTimeout = null,
+        TimeSpan? deliveryRecordingTimeout = null,
+        IMediatorDeliveryRecorder? deliveryRecorder = null)
     {
         var participantA = new Participant(Guid.NewGuid(), "A");
         var participantB = new Participant(Guid.NewGuid(), "B");
@@ -449,15 +524,17 @@ public sealed class TelegramAdapterTests
             ParticipantAUserId = ParticipantAUserId,
             ParticipantBUserId = ParticipantBUserId,
             ModelDisplayName = "Fake",
-            DeliveryTimeout = deliveryTimeout ?? TimeSpan.FromSeconds(30)
+            DeliveryTimeout = deliveryTimeout ?? TimeSpan.FromSeconds(30),
+            DeliveryRecordingTimeout = deliveryRecordingTimeout ?? TimeSpan.FromSeconds(10)
         };
         var registry = new TelegramParticipantRegistry(store, store, options);
         var transport = new RecordingTelegramTransport();
-        var recorder = new MediatorDeliveryRecorder(store);
+        var recorder = deliveryRecorder ?? new MediatorDeliveryRecorder(store);
         var dispatcher = new TelegramMediatorActionDispatcher(
             registry,
             transport,
             recorder,
+            new TelegramTextChunker(),
             options,
             NullLogger<TelegramMediatorActionDispatcher>.Instance);
         var modelRuntime = runtime ?? new RecordingModelRuntime();
@@ -572,6 +649,16 @@ public sealed class TelegramAdapterTests
                 [new SendToBoth("Для A", "Для B")]));
     }
 
+    private sealed class HangingDeliveryRecorder : IMediatorDeliveryRecorder
+    {
+        public Task RecordDeliveredAsync(
+            Guid sessionId,
+            Guid participantId,
+            string text,
+            CancellationToken cancellationToken = default) =>
+            Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+    }
+
     private sealed class RecordingTelegramTransport : ITelegramMessageTransport
     {
         public List<(long TelegramUserId, string Text)> Deliveries { get; } = [];
@@ -579,6 +666,8 @@ public sealed class TelegramAdapterTests
         public long? FailForTelegramUserId { get; set; }
 
         public long? HangForTelegramUserId { get; set; }
+
+        public Action? AfterSuccessfulSend { get; set; }
 
         public Task SendTextMessageAsync(
             long telegramUserId,
@@ -596,6 +685,7 @@ public sealed class TelegramAdapterTests
             }
 
             Deliveries.Add((telegramUserId, text));
+            AfterSuccessfulSend?.Invoke();
             return Task.CompletedTask;
         }
     }

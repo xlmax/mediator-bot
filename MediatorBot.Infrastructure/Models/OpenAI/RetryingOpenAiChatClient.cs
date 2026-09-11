@@ -165,6 +165,7 @@ public sealed class RetryingOpenAiChatClient : IOpenAiChatClient
             protocolException.Reason is
                 OpenAiProtocolFailureReason.NoChoices or
                 OpenAiProtocolFailureReason.InvalidJson or
+                OpenAiProtocolFailureReason.InvalidResponseShape or
                 OpenAiProtocolFailureReason.MissingAssistantMessage or
                 OpenAiProtocolFailureReason.InvalidAssistantContent)
         {

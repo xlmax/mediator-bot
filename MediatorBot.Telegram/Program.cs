@@ -41,6 +41,9 @@ ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHistoryMessages);
 var deliveryTimeoutSeconds = builder.Configuration.GetValue<int?>(
     "Telegram:DeliveryTimeoutSeconds") ?? 30;
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(deliveryTimeoutSeconds);
+var deliveryRecordingTimeoutSeconds = builder.Configuration.GetValue<int?>(
+    "Telegram:DeliveryRecordingTimeoutSeconds") ?? 10;
+ArgumentOutOfRangeException.ThrowIfNegativeOrZero(deliveryRecordingTimeoutSeconds);
 var modelRuntimeName = builder.Configuration["ModelRuntime"] ?? "Fake";
 var configuredModel = builder.Configuration["OpenAI:Model"] ?? "gpt-4.1-mini";
 
@@ -126,11 +129,13 @@ builder.Services.AddSingleton(new TelegramAdapterOptions
     ModelDisplayName = modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase)
         ? configuredModel
         : "Fake",
-    DeliveryTimeout = TimeSpan.FromSeconds(deliveryTimeoutSeconds)
+    DeliveryTimeout = TimeSpan.FromSeconds(deliveryTimeoutSeconds),
+    DeliveryRecordingTimeout = TimeSpan.FromSeconds(deliveryRecordingTimeoutSeconds)
 });
 builder.Services.AddSingleton<TelegramParticipantRegistry>();
 builder.Services.AddSingleton<AllowedParticipantFilter>();
 builder.Services.AddSingleton<TelegramCommandService>();
+builder.Services.AddSingleton<TelegramTextChunker>();
 builder.Services.AddSingleton<TelegramMediatorActionDispatcher>();
 builder.Services.AddSingleton<TelegramMessageProcessor>();
 builder.Services.AddSingleton<ITelegramMessageTransport, TeleFlowMessageTransport>();

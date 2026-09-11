@@ -4,6 +4,7 @@ public enum OpenAiProtocolFailureReason
 {
     Unknown,
     InvalidJson,
+    InvalidResponseShape,
     NoChoices,
     OutputTokenLimit,
     ContentFilter,

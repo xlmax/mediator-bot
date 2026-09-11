@@ -16,6 +16,13 @@ public sealed class OpenAiChatResponseParser
         {
             using var document = JsonDocument.Parse(responseData);
             var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                throw new OpenAiProtocolException(
+                    OpenAiProtocolFailureReason.InvalidResponseShape,
+                    "The provider returned a chat completion with an invalid root value.");
+            }
+
             if (root.TryGetProperty("error", out var providerError))
             {
                 throw CreateProviderException(
@@ -23,9 +30,21 @@ public sealed class OpenAiChatResponseParser
                     retryAfter: retryAfter);
             }
 
-            if (!root.TryGetProperty("choices", out var choices) ||
-                choices.ValueKind != JsonValueKind.Array ||
-                choices.GetArrayLength() == 0)
+            if (!root.TryGetProperty("choices", out var choices))
+            {
+                throw new OpenAiProtocolException(
+                    OpenAiProtocolFailureReason.NoChoices,
+                    "The provider returned no chat completion choices.");
+            }
+
+            if (choices.ValueKind != JsonValueKind.Array)
+            {
+                throw new OpenAiProtocolException(
+                    OpenAiProtocolFailureReason.InvalidResponseShape,
+                    "The provider returned an invalid chat completion choices value.");
+            }
+
+            if (choices.GetArrayLength() == 0)
             {
                 throw new OpenAiProtocolException(
                     OpenAiProtocolFailureReason.NoChoices,
@@ -33,6 +52,12 @@ public sealed class OpenAiChatResponseParser
             }
 
             var choice = choices[0];
+            if (choice.ValueKind != JsonValueKind.Object)
+            {
+                throw new OpenAiProtocolException(
+                    OpenAiProtocolFailureReason.InvalidResponseShape,
+                    "The provider returned an invalid chat completion choice.");
+            }
             var finishReason = GetOptionalString(choice, "finish_reason");
             if (finishReason == "length")
             {
@@ -89,9 +114,10 @@ public sealed class OpenAiChatResponseParser
         {
             using var document = JsonDocument.Parse(responseData);
             var root = document.RootElement;
-            var error = root.TryGetProperty("error", out var providerError)
-                ? providerError
-                : root;
+            var error = root.ValueKind == JsonValueKind.Object &&
+                root.TryGetProperty("error", out var providerError)
+                    ? providerError
+                    : root;
             return CreateProviderException(
                 error,
                 httpStatus,
@@ -140,7 +166,8 @@ public sealed class OpenAiChatResponseParser
         var result = new List<OpenAiToolCall>();
         foreach (var toolCall in toolCalls.EnumerateArray())
         {
-            if (!toolCall.TryGetProperty("function", out var function) ||
+            if (toolCall.ValueKind != JsonValueKind.Object ||
+                !toolCall.TryGetProperty("function", out var function) ||
                 function.ValueKind != JsonValueKind.Object)
             {
                 throw new OpenAiProtocolException(
@@ -187,12 +214,18 @@ public sealed class OpenAiChatResponseParser
 
         if (content.ValueKind == JsonValueKind.Array)
         {
-            return string.Concat(content
-                .EnumerateArray()
-                .Where(part =>
+            var textParts = new List<string>();
+            foreach (var part in content.EnumerateArray())
+            {
+                if (part.ValueKind == JsonValueKind.Object &&
                     part.TryGetProperty("text", out var text) &&
                     text.ValueKind == JsonValueKind.String)
-                .Select(part => part.GetProperty("text").GetString()));
+                {
+                    textParts.Add(text.GetString()!);
+                }
+            }
+
+            return string.Concat(textParts);
         }
 
         throw new OpenAiProtocolException(
@@ -414,6 +447,7 @@ public sealed class OpenAiChatResponseParser
 
     private static int GetOptionalInt32(JsonElement element, string propertyName) =>
         element.TryGetProperty(propertyName, out var property) &&
+        property.ValueKind == JsonValueKind.Number &&
         property.TryGetInt32(out var value)
             ? value
             : 0;

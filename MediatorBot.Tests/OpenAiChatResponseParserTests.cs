@@ -118,6 +118,90 @@ public sealed class OpenAiChatResponseParserTests
         Assert.DoesNotContain("upstream details", exception.Message);
     }
 
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("{\"choices\":{}}")]
+    [InlineData("{\"choices\":[\"invalid\"]}")]
+    public void Parse_ConvertsInvalidRequiredShapesToControlledProtocolFailure(
+        string responseJson)
+    {
+        var exception = Assert.Throws<OpenAiProtocolException>(() =>
+            _parser.Parse(BinaryData.FromString(responseJson), "requested-model"));
+
+        Assert.Equal(
+            OpenAiProtocolFailureReason.InvalidResponseShape,
+            exception.Reason);
+    }
+
+    [Fact]
+    public void Parse_IgnoresMalformedOptionalUsage()
+    {
+        var response = BinaryData.FromString("""
+            {
+              "choices": [{
+                "message": {
+                  "content": null,
+                  "tool_calls": [{
+                    "function": { "name": "no_action", "arguments": "{}" }
+                  }]
+                }
+              }],
+              "usage": {
+                "prompt_tokens": "unknown",
+                "completion_tokens": null,
+                "prompt_tokens_details": { "cached_tokens": [] }
+              }
+            }
+            """);
+
+        var result = _parser.Parse(response, "requested-model");
+
+        Assert.Equal(new OpenAiTokenUsage(0, 0, 0), result.Usage);
+        Assert.Single(result.ToolCalls);
+    }
+
+    [Fact]
+    public void Parse_IgnoresUnknownAssistantContentParts()
+    {
+        var response = BinaryData.FromString("""
+            {
+              "choices": [{
+                "message": {
+                  "content": [
+                    "unknown",
+                    { "type": "reasoning", "reasoning": "hidden" },
+                    { "type": "text", "text": "visible" }
+                  ]
+                }
+              }]
+            }
+            """);
+
+        var result = _parser.Parse(response, "requested-model");
+
+        Assert.Equal("visible", result.AssistantText);
+    }
+
+    [Fact]
+    public void Parse_ConvertsInvalidToolCallShapeToControlledProtocolFailure()
+    {
+        var response = BinaryData.FromString("""
+            {
+              "choices": [{
+                "message": {
+                  "content": null,
+                  "tool_calls": ["invalid"]
+                }
+              }]
+            }
+            """);
+
+        var exception = Assert.Throws<OpenAiProtocolException>(() =>
+            _parser.Parse(response, "requested-model"));
+
+        Assert.Equal(OpenAiProtocolFailureReason.InvalidToolCall, exception.Reason);
+    }
+
     [Fact]
     public void Parse_ConvertsEmptyChoicesToControlledProtocolFailure()
     {

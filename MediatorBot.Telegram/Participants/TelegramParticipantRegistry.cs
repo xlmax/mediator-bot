@@ -134,5 +134,11 @@ public sealed class TelegramParticipantRegistry(
             throw new InvalidOperationException(
                 "Telegram delivery timeout must be positive.");
         }
+
+        if (options.DeliveryRecordingTimeout <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                "Telegram delivery recording timeout must be positive.");
+        }
     }
 }

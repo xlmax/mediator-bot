@@ -8,6 +8,7 @@ public sealed class TelegramMediatorActionDispatcher(
     TelegramParticipantRegistry participantRegistry,
     ITelegramMessageTransport transport,
     IMediatorDeliveryRecorder deliveryRecorder,
+    TelegramTextChunker textChunker,
     TelegramAdapterOptions options,
     ILogger<TelegramMediatorActionDispatcher> logger)
 {
@@ -82,6 +83,33 @@ public sealed class TelegramMediatorActionDispatcher(
         string actionType,
         CancellationToken cancellationToken)
     {
+        var chunks = textChunker.Split(text);
+        for (var index = 0; index < chunks.Count; index++)
+        {
+            await DeliverChunkAsync(
+                updateId,
+                sourceTelegramUserId,
+                session,
+                participantId,
+                chunks[index],
+                actionType,
+                index + 1,
+                chunks.Count,
+                cancellationToken);
+        }
+    }
+
+    private async Task DeliverChunkAsync(
+        long updateId,
+        long sourceTelegramUserId,
+        Session session,
+        Guid participantId,
+        string text,
+        string actionType,
+        int chunkIndex,
+        int chunkCount,
+        CancellationToken cancellationToken)
+    {
         var startedAt = Stopwatch.GetTimestamp();
         var telegramUserId = await participantRegistry.GetTelegramUserIdAsync(
             participantId,
@@ -97,25 +125,6 @@ public sealed class TelegramMediatorActionDispatcher(
                 text,
                 deliveryCancellation.Token);
             await deliveryTask.WaitAsync(deliveryCancellation.Token);
-
-            await deliveryRecorder.RecordDeliveredAsync(
-                session.Id,
-                participantId,
-                text,
-                cancellationToken);
-
-            logger.LogInformation(
-                "Mediator action delivered. UpdateId={UpdateId} " +
-                "TelegramUserId={TelegramUserId} ParticipantId={ParticipantId} " +
-                "SessionId={SessionId} MediatorAction={MediatorAction} " +
-                "DeliveryResult={DeliveryResult} DurationMs={DurationMs:F1}",
-                updateId,
-                telegramUserId,
-                participantId,
-                session.Id,
-                actionType,
-                "Delivered",
-                Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
         }
         catch (Exception exception)
         {
@@ -124,17 +133,69 @@ public sealed class TelegramMediatorActionDispatcher(
                 "Mediator action delivery failed. UpdateId={UpdateId} " +
                 "TelegramUserId={TelegramUserId} ParticipantId={ParticipantId} " +
                 "SessionId={SessionId} MediatorAction={MediatorAction} " +
-                "DeliveryResult={DeliveryResult} DurationMs={DurationMs:F1} " +
+                "DeliveryResult={DeliveryResult} ChunkIndex={ChunkIndex} " +
+                "ChunkCount={ChunkCount} DurationMs={DurationMs:F1} " +
                 "ErrorType={ErrorType}",
                 updateId,
                 telegramUserId,
                 participantId,
                 session.Id,
                 actionType,
-                "Failed",
+                "DeliveryFailed",
+                chunkIndex,
+                chunkCount,
                 Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                 exception.GetType().Name);
             throw;
         }
+
+        try
+        {
+            using var recordingCancellation = new CancellationTokenSource(
+                options.DeliveryRecordingTimeout);
+            var recordingTask = deliveryRecorder.RecordDeliveredAsync(
+                session.Id,
+                participantId,
+                text,
+                recordingCancellation.Token);
+            await recordingTask.WaitAsync(recordingCancellation.Token);
+        }
+        catch (Exception exception)
+        {
+            logger.LogCritical(
+                "Mediator action was delivered but history recording failed. " +
+                "UpdateId={UpdateId} TelegramUserId={TelegramUserId} " +
+                "ParticipantId={ParticipantId} SessionId={SessionId} " +
+                "MediatorAction={MediatorAction} DeliveryResult={DeliveryResult} " +
+                "ChunkIndex={ChunkIndex} ChunkCount={ChunkCount} " +
+                "DurationMs={DurationMs:F1} ErrorType={ErrorType}",
+                updateId,
+                telegramUserId,
+                participantId,
+                session.Id,
+                actionType,
+                "DeliveredButNotRecorded",
+                chunkIndex,
+                chunkCount,
+                Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                exception.GetType().Name);
+            throw;
+        }
+
+        logger.LogInformation(
+            "Mediator action delivered. UpdateId={UpdateId} " +
+            "TelegramUserId={TelegramUserId} ParticipantId={ParticipantId} " +
+            "SessionId={SessionId} MediatorAction={MediatorAction} " +
+            "DeliveryResult={DeliveryResult} ChunkIndex={ChunkIndex} " +
+            "ChunkCount={ChunkCount} DurationMs={DurationMs:F1}",
+            updateId,
+            telegramUserId,
+            participantId,
+            session.Id,
+            actionType,
+            "Delivered",
+            chunkIndex,
+            chunkCount,
+            Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
     }
 }

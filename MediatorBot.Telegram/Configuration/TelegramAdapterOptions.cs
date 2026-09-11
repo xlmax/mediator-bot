@@ -11,4 +11,6 @@ public sealed class TelegramAdapterOptions
     public required string ModelDisplayName { get; init; }
 
     public TimeSpan DeliveryTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    public TimeSpan DeliveryRecordingTimeout { get; init; } = TimeSpan.FromSeconds(10);
 }
