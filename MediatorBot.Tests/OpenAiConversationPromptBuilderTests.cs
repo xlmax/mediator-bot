@@ -115,6 +115,28 @@ public sealed class OpenAiConversationPromptBuilderTests
         Assert.Contains("Не оставляй инициатора в ожидании", prompt);
     }
 
+    [Fact]
+    public void SystemPrompt_DefinesProportionalAntiRuminationPolicy()
+    {
+        var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
+
+        Assert.Contains("PROPORTIONALITY AND ANTI-RUMINATION", prompt);
+        Assert.Contains("Не каждое раздражение требует анализа", prompt);
+        Assert.Contains("Не создавай глубину там, где её может не быть", prompt);
+        Assert.Contains("VENT, REFLECT, MEDIATE", prompt);
+        Assert.Contains("Предпочитай естественное угасание мелких эмоций", prompt);
+        Assert.Contains("Не превращай себя в журнал претензий", prompt);
+        Assert.Contains("Не поддерживай grievance amplification", prompt);
+        Assert.Contains("сохраняется ли проблема после снижения эмоций", prompt);
+        Assert.Contains("Анти-руминационная политика не означает", prompt);
+        Assert.Contains("не задавай обязательный уточняющий вопрос", prompt);
+        Assert.Contains("не ослабляет INFORMATION BOUNDARY", prompt);
+        Assert.Contains("не даёт разрешения раскрывать информацию", prompt);
+        Assert.True(
+            prompt.IndexOf("PROPORTIONALITY AND ANTI-RUMINATION", StringComparison.Ordinal) <
+            prompt.IndexOf("DISCLOSURE DECISIONS", StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData("PrivateResponse")]
     [InlineData("MediatorDisclosure")]
