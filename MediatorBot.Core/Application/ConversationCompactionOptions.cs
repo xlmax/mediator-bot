@@ -4,11 +4,11 @@ public sealed class ConversationCompactionOptions
 {
     public bool Enabled { get; init; } = true;
 
-    public int TriggerMessageCount { get; init; } = 100;
+    public int TriggerMessageCount { get; init; } = 200;
 
     public int TriggerHistoryCharacters { get; init; } = 50_000;
 
-    public int RetainRecentMessageCount { get; init; } = 40;
+    public int RetainRecentMessageCount { get; init; } = 80;
 
     public int RetainRecentCharacters { get; init; } = 20_000;
 

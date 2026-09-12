@@ -25,6 +25,9 @@ public sealed class TelegramSessionWorkQueue(
 
     private readonly Lock _lock = new();
     private readonly Dictionary<Guid, SessionQueueState> _states = [];
+    private readonly HashSet<TaskCompletionSource> _activeRunners = [];
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private bool _stopping;
 
     public async Task<TelegramMessageProcessingStatus> ProcessEnqueuedAsync(
         PendingExternalTurn turn,
@@ -34,18 +37,23 @@ public sealed class TelegramSessionWorkQueue(
         var completion = new TaskCompletionSource<TelegramMessageProcessingStatus>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         SessionQueueState state;
-        var startRunner = false;
+        TaskCompletionSource? runnerCompletion = null;
         var notifyDuringCompaction = false;
 
         lock (_lock)
         {
+            if (_stopping)
+            {
+                throw new OperationCanceledException(
+                    "Telegram turn processing is stopping. The durable turn remains pending.");
+            }
+
             state = GetOrCreateState(turn.SessionId);
             state.WakeVersion++;
             state.Waiters.Add(turn.Id, completion);
             if (!state.IsRunning)
             {
-                state.IsRunning = true;
-                startRunner = true;
+                runnerCompletion = PrepareRunner(state);
             }
 
             notifyDuringCompaction = state.IsCompacting;
@@ -56,9 +64,9 @@ public sealed class TelegramSessionWorkQueue(
             EnsureCompactionNotification(state, turn);
         }
 
-        if (startRunner)
+        if (runnerCompletion is not null)
         {
-            _ = RunSessionAsync(turn.SessionId, state);
+            StartRunner(turn.SessionId, state, runnerCompletion);
         }
 
         return await completion.Task.WaitAsync(cancellationToken);
@@ -70,24 +78,83 @@ public sealed class TelegramSessionWorkQueue(
     {
         cancellationToken.ThrowIfCancellationRequested();
         SessionQueueState state;
-        var startRunner = false;
+        TaskCompletionSource? runnerCompletion = null;
         lock (_lock)
         {
+            if (_stopping)
+            {
+                return Task.CompletedTask;
+            }
+
             state = GetOrCreateState(sessionId);
             state.WakeVersion++;
             if (!state.IsRunning)
             {
-                state.IsRunning = true;
-                startRunner = true;
+                runnerCompletion = PrepareRunner(state);
             }
         }
 
-        if (startRunner)
+        if (runnerCompletion is not null)
         {
-            _ = RunSessionAsync(sessionId, state);
+            StartRunner(sessionId, state, runnerCompletion);
         }
 
         return Task.CompletedTask;
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        Task[] runners;
+        lock (_lock)
+        {
+            _stopping = true;
+            _lifetimeCancellation.Cancel();
+            runners = _activeRunners
+                .Select(completion => completion.Task)
+                .ToArray();
+        }
+
+        await Task.WhenAll(runners).WaitAsync(cancellationToken);
+    }
+
+    private TaskCompletionSource PrepareRunner(SessionQueueState state)
+    {
+        state.IsRunning = true;
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        state.RunnerCompletion = completion;
+        _activeRunners.Add(completion);
+        return completion;
+    }
+
+    private void StartRunner(
+        Guid sessionId,
+        SessionQueueState state,
+        TaskCompletionSource completion) =>
+        _ = RunSessionTrackedAsync(sessionId, state, completion);
+
+    private async Task RunSessionTrackedAsync(
+        Guid sessionId,
+        SessionQueueState state,
+        TaskCompletionSource completion)
+    {
+        try
+        {
+            await RunSessionAsync(sessionId, state);
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                _activeRunners.Remove(completion);
+                if (ReferenceEquals(state.RunnerCompletion, completion))
+                {
+                    state.RunnerCompletion = null;
+                }
+            }
+
+            completion.TrySetResult();
+        }
     }
 
     private async Task RunSessionAsync(Guid sessionId, SessionQueueState state)
@@ -98,6 +165,12 @@ public sealed class TelegramSessionWorkQueue(
             if (plan is not null)
             {
                 await RunCompactionAsync(state, plan);
+            }
+
+            if (IsStopping())
+            {
+                StopRunner(state);
+                return;
             }
 
             long observedWakeVersion;
@@ -119,7 +192,7 @@ public sealed class TelegramSessionWorkQueue(
                     sessionId,
                     exception.GetType().Name);
                 StopRunner(state);
-                _ = RecoverAfterDelayAsync(sessionId);
+                ScheduleRecovery(sessionId);
                 return;
             }
 
@@ -146,6 +219,11 @@ public sealed class TelegramSessionWorkQueue(
                     CancellationToken.None);
                 await turnQueueStore.CompleteAsync(sessionId, turn.Id);
                 CompleteWaiter(state, turn.Id, result);
+                if (IsStopping())
+                {
+                    StopRunner(state);
+                    return;
+                }
             }
             catch (Exception exception)
             {
@@ -157,7 +235,7 @@ public sealed class TelegramSessionWorkQueue(
                     exception.GetType().Name);
                 FailWaiter(state, turn.Id, exception);
                 StopRunner(state);
-                _ = RecoverAfterDelayAsync(sessionId);
+                ScheduleRecovery(sessionId);
                 return;
             }
         }
@@ -356,10 +434,40 @@ public sealed class TelegramSessionWorkQueue(
         waiter?.TrySetException(exception);
     }
 
+    private void ScheduleRecovery(Guid sessionId)
+    {
+        lock (_lock)
+        {
+            if (_stopping)
+            {
+                return;
+            }
+        }
+
+        _ = RecoverAfterDelayAsync(sessionId);
+    }
+
     private async Task RecoverAfterDelayAsync(Guid sessionId)
     {
-        await Task.Delay(compactionOptions.RetryDelay);
-        await RecoverSessionAsync(sessionId);
+        try
+        {
+            await Task.Delay(
+                compactionOptions.RetryDelay,
+                _lifetimeCancellation.Token);
+            await RecoverSessionAsync(sessionId, _lifetimeCancellation.Token);
+        }
+        catch (OperationCanceledException)
+            when (_lifetimeCancellation.IsCancellationRequested)
+        {
+        }
+    }
+
+    private bool IsStopping()
+    {
+        lock (_lock)
+        {
+            return _stopping;
+        }
     }
 
     private void StopRunner(SessionQueueState state)
@@ -382,6 +490,8 @@ public sealed class TelegramSessionWorkQueue(
         public Dictionary<long, Task> StartNotificationTasks { get; } = [];
 
         public bool IsRunning { get; set; }
+
+        public TaskCompletionSource? RunnerCompletion { get; set; }
 
         public bool IsCompacting { get; set; }
 

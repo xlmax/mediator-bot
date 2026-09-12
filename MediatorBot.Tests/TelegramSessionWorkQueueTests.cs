@@ -112,6 +112,43 @@ public sealed class TelegramSessionWorkQueueTests
     }
 
     [Fact]
+    public async Task StopAsync_DrainsRunningTurnAndLeavesNewDurableTurnForRecovery()
+    {
+        var session = CreateSession();
+        var store = new InMemoryConversationStore([session]);
+        var processor = new BlockingTurnProcessor();
+        var queue = CreateQueue(
+            session,
+            new NoCompactionService(),
+            new ConcurrentRecordingTransport(),
+            store,
+            processor).Queue;
+        var first = CreateTurn(session, 8, 10001);
+        Assert.True(await store.TryEnqueueAsync(first));
+        var processing = queue.ProcessEnqueuedAsync(first);
+        await processor.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var stopping = queue.StopAsync();
+        await Task.Delay(50);
+        Assert.False(stopping.IsCompleted);
+
+        var second = CreateTurn(session, 9, 10002);
+        Assert.True(await store.TryEnqueueAsync(second));
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            queue.ProcessEnqueuedAsync(second));
+
+        processor.Release.TrySetResult();
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Processed,
+            await processing.WaitAsync(TimeSpan.FromSeconds(5)));
+        await stopping.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var pending = await store.GetPendingAsync(session.Id);
+        Assert.Single(pending);
+        Assert.Equal(second.Id, pending[0].Id);
+    }
+
+    [Fact]
     public async Task RecoverSession_ProcessesPersistedTurnWithoutOriginalHandler()
     {
         var session = CreateSession();
@@ -254,6 +291,24 @@ public sealed class TelegramSessionWorkQueueTests
         {
             _order.Enqueue(turn.SourceSequence);
             return Task.FromResult(TelegramMessageProcessingStatus.Processed);
+        }
+    }
+
+    private sealed class BlockingTurnProcessor : ITelegramQueuedTurnProcessor
+    {
+        public TaskCompletionSource Entered { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<TelegramMessageProcessingStatus> ProcessAsync(
+            PendingExternalTurn turn,
+            CancellationToken cancellationToken = default)
+        {
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(cancellationToken);
+            return TelegramMessageProcessingStatus.Processed;
         }
     }
 

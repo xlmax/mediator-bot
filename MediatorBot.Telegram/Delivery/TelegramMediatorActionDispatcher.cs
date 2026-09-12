@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using MediatorBot.Core;
 using Microsoft.Extensions.Logging;
 
@@ -7,30 +8,38 @@ namespace MediatorBot.Telegram;
 public sealed class TelegramMediatorActionDispatcher(
     TelegramParticipantRegistry participantRegistry,
     ITelegramMessageTransport transport,
-    IMediatorDeliveryRecorder deliveryRecorder,
+    ITurnExecutionStore turnExecutionStore,
     IMediatedRequestStore mediatedRequestStore,
     TelegramTextChunker textChunker,
     TelegramAdapterOptions options,
     ILogger<TelegramMediatorActionDispatcher> logger)
 {
     public async Task DispatchAsync(
-        long updateId,
-        long sourceTelegramUserId,
+        PendingExternalTurn turn,
         Session session,
         IReadOnlyList<MediatorAction> actions,
         CancellationToken cancellationToken = default)
     {
-        foreach (var action in actions)
+        ArgumentNullException.ThrowIfNull(turn);
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(actions);
+        var sourceTelegramUserId = long.Parse(
+            turn.ExternalUserId,
+            CultureInfo.InvariantCulture);
+
+        for (var actionIndex = 0; actionIndex < actions.Count; actionIndex++)
         {
+            var action = actions[actionIndex];
             switch (action)
             {
                 case SendToParticipant send:
                     await DeliverAsync(
-                        updateId,
+                        turn,
                         sourceTelegramUserId,
                         session,
                         send.ParticipantId,
                         send.Text,
+                        $"{actionIndex}:participant",
                         nameof(SendToParticipant),
                         send.DisclosureDecision,
                         cancellationToken);
@@ -38,20 +47,22 @@ public sealed class TelegramMediatorActionDispatcher(
 
                 case SendToBoth send:
                     await DeliverAsync(
-                        updateId,
+                        turn,
                         sourceTelegramUserId,
                         session,
                         session.ParticipantA.Id,
                         send.TextForParticipantA,
+                        $"{actionIndex}:participant-a",
                         nameof(SendToBoth),
                         send.DisclosureDecision,
                         cancellationToken);
                     await DeliverAsync(
-                        updateId,
+                        turn,
                         sourceTelegramUserId,
                         session,
                         session.ParticipantB.Id,
                         send.TextForParticipantB,
+                        $"{actionIndex}:participant-b",
                         nameof(SendToBoth),
                         send.DisclosureDecision,
                         cancellationToken);
@@ -59,28 +70,31 @@ public sealed class TelegramMediatorActionDispatcher(
 
                 case OpenMediatedRequest open:
                     await OpenRequestAsync(
-                        updateId,
+                        turn,
                         sourceTelegramUserId,
                         session,
                         open,
+                        actionIndex,
                         cancellationToken);
                     break;
 
                 case ResolveMediatedRequest resolve:
                     await ResolveRequestAsync(
-                        updateId,
+                        turn,
                         sourceTelegramUserId,
                         session,
                         resolve,
+                        actionIndex,
                         cancellationToken);
                     break;
 
                 case CancelMediatedRequest cancel:
                     await CancelRequestAsync(
-                        updateId,
+                        turn,
                         sourceTelegramUserId,
                         session,
                         cancel,
+                        actionIndex,
                         cancellationToken);
                     break;
 
@@ -91,7 +105,7 @@ public sealed class TelegramMediatorActionDispatcher(
                         "MediatorAction={MediatorAction} " +
                         "DisclosureDecision={DisclosureDecision} " +
                         "DeliveryResult={DeliveryResult} DurationMs={DurationMs:F1}",
-                        updateId,
+                        turn.SourceSequence,
                         sourceTelegramUserId,
                         session.Id,
                         nameof(NoAction),
@@ -108,10 +122,11 @@ public sealed class TelegramMediatorActionDispatcher(
     }
 
     private async Task OpenRequestAsync(
-        long updateId,
+        PendingExternalTurn turn,
         long sourceTelegramUserId,
         Session session,
         OpenMediatedRequest action,
+        int actionIndex,
         CancellationToken cancellationToken)
     {
         var request = new MediatedRequest(
@@ -121,20 +136,21 @@ public sealed class TelegramMediatorActionDispatcher(
             action.RespondentId,
             action.Summary,
             MediatedRequestStatus.PendingDelivery,
-            DateTimeOffset.UtcNow);
+            turn.CreatedAt);
         await mediatedRequestStore.CreateAsync(request, cancellationToken);
 
         await DeliverAsync(
-            updateId,
+            turn,
             sourceTelegramUserId,
             session,
             action.RespondentId,
             action.TextForRespondent,
+            $"{actionIndex}:open:respondent",
             nameof(OpenMediatedRequest),
             action.DisclosureDecision,
             cancellationToken);
         await PersistRequestTransitionAsync(
-            updateId,
+            turn.SourceSequence,
             sourceTelegramUserId,
             session.Id,
             action.RequestId,
@@ -144,29 +160,32 @@ public sealed class TelegramMediatorActionDispatcher(
                 action.RequestId,
                 token));
         await DeliverAsync(
-            updateId,
+            turn,
             sourceTelegramUserId,
             session,
             action.RequesterId,
             action.TextForRequester,
+            $"{actionIndex}:open:requester",
             nameof(OpenMediatedRequest),
             action.DisclosureDecision,
             cancellationToken);
     }
 
     private async Task ResolveRequestAsync(
-        long updateId,
+        PendingExternalTurn turn,
         long sourceTelegramUserId,
         Session session,
         ResolveMediatedRequest action,
+        int actionIndex,
         CancellationToken cancellationToken)
     {
         await DeliverAsync(
-            updateId,
+            turn,
             sourceTelegramUserId,
             session,
             action.RequesterId,
             action.TextForRequester,
+            $"{actionIndex}:resolve:requester",
             nameof(ResolveMediatedRequest),
             action.DisclosureDecision,
             cancellationToken);
@@ -180,7 +199,7 @@ public sealed class TelegramMediatorActionDispatcher(
                 $"Unsupported mediated request outcome '{action.Outcome}'.")
         };
         await PersistRequestTransitionAsync(
-            updateId,
+            turn.SourceSequence,
             sourceTelegramUserId,
             session.Id,
             action.RequestId,
@@ -195,11 +214,12 @@ public sealed class TelegramMediatorActionDispatcher(
         if (action.TextForRespondent is not null)
         {
             await DeliverAsync(
-                updateId,
+                turn,
                 sourceTelegramUserId,
                 session,
                 action.RespondentId,
                 action.TextForRespondent,
+                $"{actionIndex}:resolve:respondent",
                 nameof(ResolveMediatedRequest),
                 action.DisclosureDecision,
                 cancellationToken);
@@ -207,23 +227,25 @@ public sealed class TelegramMediatorActionDispatcher(
     }
 
     private async Task CancelRequestAsync(
-        long updateId,
+        PendingExternalTurn turn,
         long sourceTelegramUserId,
         Session session,
         CancelMediatedRequest action,
+        int actionIndex,
         CancellationToken cancellationToken)
     {
         await DeliverAsync(
-            updateId,
+            turn,
             sourceTelegramUserId,
             session,
             action.RespondentId,
             action.TextForRespondent,
+            $"{actionIndex}:cancel:respondent",
             nameof(CancelMediatedRequest),
             action.DisclosureDecision,
             cancellationToken);
         await PersistRequestTransitionAsync(
-            updateId,
+            turn.SourceSequence,
             sourceTelegramUserId,
             session.Id,
             action.RequestId,
@@ -235,11 +257,12 @@ public sealed class TelegramMediatorActionDispatcher(
                 DateTimeOffset.UtcNow,
                 token));
         await DeliverAsync(
-            updateId,
+            turn,
             sourceTelegramUserId,
             session,
             action.RequesterId,
             action.TextForRequester,
+            $"{actionIndex}:cancel:requester",
             nameof(CancelMediatedRequest),
             action.DisclosureDecision,
             cancellationToken);
@@ -257,8 +280,8 @@ public sealed class TelegramMediatorActionDispatcher(
         {
             using var persistenceCancellation = new CancellationTokenSource(
                 options.DeliveryRecordingTimeout);
-            var transitionTask = transition(persistenceCancellation.Token);
-            await transitionTask.WaitAsync(persistenceCancellation.Token);
+            await transition(persistenceCancellation.Token)
+                .WaitAsync(persistenceCancellation.Token);
         }
         catch (Exception exception)
         {
@@ -278,47 +301,71 @@ public sealed class TelegramMediatorActionDispatcher(
     }
 
     private async Task DeliverAsync(
-        long updateId,
+        PendingExternalTurn turn,
         long sourceTelegramUserId,
         Session session,
         Guid participantId,
         string text,
+        string deliveryKey,
         string actionType,
         DisclosureDecision disclosureDecision,
         CancellationToken cancellationToken)
     {
         var chunks = textChunker.Split(text);
-        for (var index = 0; index < chunks.Count; index++)
-        {
-            await DeliverChunkAsync(
-                updateId,
-                sourceTelegramUserId,
-                session,
+        var deliveries = await turnExecutionStore.EnsureDeliveryPlanAsync(
+            new TurnDeliveryPlan(
+                turn.Id,
+                session.Id,
                 participantId,
-                chunks[index],
+                deliveryKey,
+                chunks,
                 actionType,
                 disclosureDecision,
-                index + 1,
-                chunks.Count,
+                turn.CreatedAt),
+            cancellationToken);
+        foreach (var delivery in deliveries.OrderBy(delivery => delivery.ChunkIndex))
+        {
+            if (delivery.Status == TurnDeliveryStatus.Delivered)
+            {
+                logger.LogInformation(
+                    "Previously delivered mediator action chunk skipped during recovery. " +
+                    "UpdateId={UpdateId} ParticipantId={ParticipantId} " +
+                    "SessionId={SessionId} MediatorAction={MediatorAction} " +
+                    "ChunkIndex={ChunkIndex} ChunkCount={ChunkCount}",
+                    turn.SourceSequence,
+                    participantId,
+                    session.Id,
+                    actionType,
+                    delivery.ChunkIndex,
+                    delivery.ChunkCount);
+                continue;
+            }
+
+            await DeliverChunkAsync(
+                turn,
+                sourceTelegramUserId,
+                session,
+                delivery,
                 cancellationToken);
         }
     }
 
     private async Task DeliverChunkAsync(
-        long updateId,
+        PendingExternalTurn turn,
         long sourceTelegramUserId,
         Session session,
-        Guid participantId,
-        string text,
-        string actionType,
-        DisclosureDecision disclosureDecision,
-        int chunkIndex,
-        int chunkCount,
+        TurnDelivery delivery,
         CancellationToken cancellationToken)
     {
         var startedAt = Stopwatch.GetTimestamp();
         var telegramUserId = await participantRegistry.GetTelegramUserIdAsync(
-            participantId,
+            delivery.ParticipantId,
+            cancellationToken);
+        await turnExecutionStore.MarkDeliveryAttemptingAsync(
+            session.Id,
+            turn.Id,
+            delivery.Id,
+            DateTimeOffset.UtcNow,
             cancellationToken);
 
         try
@@ -326,15 +373,13 @@ public sealed class TelegramMediatorActionDispatcher(
             using var deliveryCancellation =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             deliveryCancellation.CancelAfter(options.DeliveryTimeout);
-            var deliveryTask = transport.SendTextMessageAsync(
+            await transport.SendTextMessageAsync(
                 telegramUserId,
-                text,
-                deliveryCancellation.Token);
-            await deliveryTask.WaitAsync(deliveryCancellation.Token);
+                delivery.Text,
+                deliveryCancellation.Token).WaitAsync(deliveryCancellation.Token);
         }
         catch (Exception exception)
         {
-            // Telegram/provider errors can contain request details. Log only technical data.
             logger.LogError(
                 "Mediator action delivery failed. UpdateId={UpdateId} " +
                 "TelegramUserId={TelegramUserId} ParticipantId={ParticipantId} " +
@@ -343,15 +388,15 @@ public sealed class TelegramMediatorActionDispatcher(
                 "DeliveryResult={DeliveryResult} ChunkIndex={ChunkIndex} " +
                 "ChunkCount={ChunkCount} DurationMs={DurationMs:F1} " +
                 "ErrorType={ErrorType}",
-                updateId,
+                turn.SourceSequence,
                 telegramUserId,
-                participantId,
+                delivery.ParticipantId,
                 session.Id,
-                actionType,
-                disclosureDecision,
+                delivery.ActionType,
+                delivery.DisclosureDecision,
                 "DeliveryFailed",
-                chunkIndex,
-                chunkCount,
+                delivery.ChunkIndex,
+                delivery.ChunkCount,
                 Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                 exception.GetType().Name);
             throw;
@@ -361,32 +406,32 @@ public sealed class TelegramMediatorActionDispatcher(
         {
             using var recordingCancellation = new CancellationTokenSource(
                 options.DeliveryRecordingTimeout);
-            var recordingTask = deliveryRecorder.RecordDeliveredAsync(
+            await turnExecutionStore.RecordDeliveryAsync(
                 session.Id,
-                participantId,
-                text,
-                recordingCancellation.Token);
-            await recordingTask.WaitAsync(recordingCancellation.Token);
+                turn.Id,
+                delivery.Id,
+                DateTimeOffset.UtcNow,
+                recordingCancellation.Token).WaitAsync(recordingCancellation.Token);
         }
         catch (Exception exception)
         {
             logger.LogCritical(
-                "Mediator action was delivered but history recording failed. " +
+                "Mediator action was delivered but outbox recording failed. " +
                 "UpdateId={UpdateId} TelegramUserId={TelegramUserId} " +
                 "ParticipantId={ParticipantId} SessionId={SessionId} " +
                 "MediatorAction={MediatorAction} " +
                 "DisclosureDecision={DisclosureDecision} " +
-                "DeliveryResult={DeliveryResult} ChunkIndex={ChunkIndex} ChunkCount={ChunkCount} " +
-                "DurationMs={DurationMs:F1} ErrorType={ErrorType}",
-                updateId,
+                "DeliveryResult={DeliveryResult} ChunkIndex={ChunkIndex} " +
+                "ChunkCount={ChunkCount} DurationMs={DurationMs:F1} ErrorType={ErrorType}",
+                turn.SourceSequence,
                 telegramUserId,
-                participantId,
+                delivery.ParticipantId,
                 session.Id,
-                actionType,
-                disclosureDecision,
+                delivery.ActionType,
+                delivery.DisclosureDecision,
                 "DeliveredButNotRecorded",
-                chunkIndex,
-                chunkCount,
+                delivery.ChunkIndex,
+                delivery.ChunkCount,
                 Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                 exception.GetType().Name);
             throw;
@@ -399,15 +444,15 @@ public sealed class TelegramMediatorActionDispatcher(
             "DisclosureDecision={DisclosureDecision} " +
             "DeliveryResult={DeliveryResult} ChunkIndex={ChunkIndex} " +
             "ChunkCount={ChunkCount} DurationMs={DurationMs:F1}",
-            updateId,
+            turn.SourceSequence,
             telegramUserId,
-            participantId,
+            delivery.ParticipantId,
             session.Id,
-            actionType,
-            disclosureDecision,
-            "Delivered",
-            chunkIndex,
-            chunkCount,
+            delivery.ActionType,
+            delivery.DisclosureDecision,
+            "DeliveredAndRecorded",
+            delivery.ChunkIndex,
+            delivery.ChunkCount,
             Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
     }
 }

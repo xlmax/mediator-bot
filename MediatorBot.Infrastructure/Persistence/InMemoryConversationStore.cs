@@ -7,6 +7,7 @@ public sealed class InMemoryConversationStore :
     IParticipantIdentityStore,
     IExternalUpdateStore,
     IExternalTurnQueueStore,
+    ITurnExecutionStore,
     IMediatedRequestStore,
     IConversationCompactionStore
 {
@@ -20,6 +21,9 @@ public sealed class InMemoryConversationStore :
         (string Source, Guid SessionId, string ExternalUpdateId)> _externalUpdates = [];
     private readonly Dictionary<Guid, MediatedRequest> _mediatedRequests = [];
     private readonly Dictionary<Guid, PendingExternalTurn> _pendingTurns = [];
+    private readonly Dictionary<Guid, string> _modelResultsByTurn = [];
+    private readonly Dictionary<Guid, TurnDelivery> _turnDeliveries = [];
+    private readonly HashSet<Guid> _recordedIncomingTurns = [];
     private readonly Dictionary<Guid, ConversationSummary> _conversationSummaries = [];
     private long _nextMessageSequence;
 
@@ -82,8 +86,30 @@ public sealed class InMemoryConversationStore :
             }
 
             ValidateParticipants(session, message);
+            var existing = _messagesBySession.Values
+                .SelectMany(messages => messages)
+                .FirstOrDefault(entry => entry.Message.Id == message.Id)
+                ?.Message;
+            if (existing is not null)
+            {
+                EnsureSameMessage(existing, message);
+                return Task.CompletedTask;
+            }
+
+            if (_recordedIncomingTurns.Contains(message.Id))
+            {
+                EnsureMatchesPendingTurn(message);
+                return Task.CompletedTask;
+            }
+
             _messagesBySession[message.SessionId].Add(
                 new SequencedMessage(++_nextMessageSequence, message));
+            if (message.Direction == MessageDirection.ParticipantToMediator &&
+                _pendingTurns.ContainsKey(message.Id))
+            {
+                EnsureMatchesPendingTurn(message);
+                _recordedIncomingTurns.Add(message.Id);
+            }
         }
 
         return Task.CompletedTask;
@@ -146,11 +172,13 @@ public sealed class InMemoryConversationStore :
                     nameof(request));
             }
 
-            if (!_mediatedRequests.TryAdd(request.Id, request))
+            if (_mediatedRequests.TryGetValue(request.Id, out var existing))
             {
-                throw new InvalidOperationException(
-                    $"Mediated request '{request.Id}' already exists.");
+                EnsureSameRequestIdentity(existing, request);
+                return Task.CompletedTask;
             }
+
+            _mediatedRequests.Add(request.Id, request);
         }
 
         return Task.CompletedTask;
@@ -166,6 +194,11 @@ public sealed class InMemoryConversationStore :
         lock (_lock)
         {
             var request = GetRequest(sessionId, requestId);
+            if (request.Status == MediatedRequestStatus.AwaitingResponse)
+            {
+                return Task.CompletedTask;
+            }
+
             if (request.Status != MediatedRequestStatus.PendingDelivery)
             {
                 throw new InvalidOperationException(
@@ -194,6 +227,11 @@ public sealed class InMemoryConversationStore :
         lock (_lock)
         {
             var request = GetRequest(sessionId, requestId);
+            if (request.Status == status && request.ResolvedAt is not null)
+            {
+                return Task.CompletedTask;
+            }
+
             if (request.Status != MediatedRequestStatus.AwaitingResponse)
             {
                 throw new InvalidOperationException(
@@ -335,8 +373,7 @@ public sealed class InMemoryConversationStore :
             }
 
             IEnumerable<Message> history = messages
-                .OrderBy(entry => entry.Message.CreatedAt)
-                .ThenBy(entry => entry.Sequence)
+                .OrderBy(entry => entry.Sequence)
                 .Select(entry => entry.Message);
             if (maxMessages is not null)
             {
@@ -418,6 +455,192 @@ public sealed class InMemoryConversationStore :
             }
 
             _pendingTurns.Remove(turnId);
+            _modelResultsByTurn.Remove(turnId);
+            _recordedIncomingTurns.Remove(turnId);
+            foreach (var deliveryId in _turnDeliveries.Values
+                         .Where(delivery => delivery.TurnId == turnId)
+                         .Select(delivery => delivery.Id)
+                         .ToArray())
+            {
+                _turnDeliveries.Remove(deliveryId);
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<string?> GetModelResultAsync(
+        Guid sessionId,
+        Guid turnId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            GetPendingTurn(sessionId, turnId);
+            return Task.FromResult(_modelResultsByTurn.GetValueOrDefault(turnId));
+        }
+    }
+
+    public Task SaveModelResultAsync(
+        Guid sessionId,
+        Guid turnId,
+        string modelResultJson,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(modelResultJson);
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            GetPendingTurn(sessionId, turnId);
+            if (_modelResultsByTurn.TryGetValue(turnId, out var existing))
+            {
+                if (!string.Equals(existing, modelResultJson, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"Turn '{turnId}' already has a different persisted model result.");
+                }
+
+                return Task.CompletedTask;
+            }
+
+            _modelResultsByTurn.Add(turnId, modelResultJson);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<TurnDelivery>> EnsureDeliveryPlanAsync(
+        TurnDeliveryPlan plan,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ValidateDeliveryPlan(plan);
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            GetPendingTurn(plan.SessionId, plan.TurnId);
+            var session = _sessions[plan.SessionId];
+            session.GetParticipant(plan.ParticipantId);
+            var existing = _turnDeliveries.Values
+                .Where(delivery =>
+                    delivery.TurnId == plan.TurnId &&
+                    delivery.DeliveryKey == plan.DeliveryKey)
+                .OrderBy(delivery => delivery.ChunkIndex)
+                .ToArray();
+            if (existing.Length > 0)
+            {
+                EnsureSameDeliveryPlan(existing, plan);
+                return Task.FromResult<IReadOnlyList<TurnDelivery>>(existing);
+            }
+
+            var logicalMessageId = Guid.NewGuid();
+            var deliveries = plan.Chunks
+                .Select((text, index) => new TurnDelivery(
+                    Guid.NewGuid(),
+                    plan.TurnId,
+                    plan.SessionId,
+                    plan.ParticipantId,
+                    logicalMessageId,
+                    plan.DeliveryKey,
+                    index + 1,
+                    plan.Chunks.Count,
+                    text,
+                    plan.ActionType,
+                    plan.DisclosureDecision,
+                    TurnDeliveryStatus.Pending,
+                    plan.CreatedAt))
+                .ToArray();
+            foreach (var delivery in deliveries)
+            {
+                _turnDeliveries.Add(delivery.Id, delivery);
+            }
+
+            return Task.FromResult<IReadOnlyList<TurnDelivery>>(deliveries);
+        }
+    }
+
+    public Task MarkDeliveryAttemptingAsync(
+        Guid sessionId,
+        Guid turnId,
+        Guid deliveryId,
+        DateTimeOffset attemptedAt,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            var delivery = GetTurnDelivery(sessionId, turnId, deliveryId);
+            if (delivery.Status != TurnDeliveryStatus.Delivered)
+            {
+                _turnDeliveries[deliveryId] = delivery with
+                {
+                    Status = TurnDeliveryStatus.Attempting,
+                    AttemptedAt = attemptedAt
+                };
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task RecordDeliveryAsync(
+        Guid sessionId,
+        Guid turnId,
+        Guid deliveryId,
+        DateTimeOffset deliveredAt,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            var delivery = GetTurnDelivery(sessionId, turnId, deliveryId);
+            if (delivery.Status == TurnDeliveryStatus.Delivered)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (delivery.Status != TurnDeliveryStatus.Attempting)
+            {
+                throw new InvalidOperationException(
+                    $"Turn delivery '{deliveryId}' was not marked as attempting.");
+            }
+
+            delivery = delivery with
+            {
+                Status = TurnDeliveryStatus.Delivered,
+                DeliveredAt = deliveredAt
+            };
+            _turnDeliveries[deliveryId] = delivery;
+            var deliveredChunks = _turnDeliveries.Values
+                .Where(candidate =>
+                    candidate.LogicalMessageId == delivery.LogicalMessageId &&
+                    candidate.Status == TurnDeliveryStatus.Delivered)
+                .OrderBy(candidate => candidate.ChunkIndex)
+                .ToArray();
+            var text = string.Concat(deliveredChunks.Select(candidate => candidate.Text));
+            var createdAt = deliveredChunks.Min(candidate => candidate.DeliveredAt)!.Value;
+            var message = new Message(
+                delivery.LogicalMessageId,
+                sessionId,
+                null,
+                delivery.ParticipantId,
+                MessageDirection.MediatorToParticipant,
+                text,
+                createdAt);
+            var messages = _messagesBySession[sessionId];
+            var existingIndex = messages.FindIndex(entry =>
+                entry.Message.Id == delivery.LogicalMessageId);
+            if (existingIndex < 0)
+            {
+                messages.Add(new SequencedMessage(++_nextMessageSequence, message));
+            }
+            else
+            {
+                messages[existingIndex] = new SequencedMessage(
+                    messages[existingIndex].Sequence,
+                    message);
+            }
         }
 
         return Task.CompletedTask;
@@ -456,6 +679,14 @@ public sealed class InMemoryConversationStore :
             var messages = _messagesBySession[sessionId]
                 .OrderBy(entry => entry.Sequence)
                 .ToArray();
+            var firstPendingIndex = Array.FindIndex(messages, entry =>
+                _recordedIncomingTurns.Contains(entry.Message.Id) &&
+                _pendingTurns.ContainsKey(entry.Message.Id));
+            if (firstPendingIndex >= 0)
+            {
+                messages = messages.Take(firstPendingIndex).ToArray();
+            }
+
             if (messages.Length < triggerMessageCount &&
                 messages.Sum(entry => entry.Message.Text.Length) < triggerCharacterCount)
             {
@@ -563,6 +794,114 @@ public sealed class InMemoryConversationStore :
             throw new ArgumentOutOfRangeException(
                 nameof(retainRecentMessageCount),
                 "Retained history must be below its compaction trigger.");
+        }
+    }
+
+    private PendingExternalTurn GetPendingTurn(Guid sessionId, Guid turnId)
+    {
+        if (!_pendingTurns.TryGetValue(turnId, out var turn) ||
+            turn.SessionId != sessionId)
+        {
+            throw new KeyNotFoundException(
+                $"Pending turn '{turnId}' was not found in session '{sessionId}'.");
+        }
+
+        return turn;
+    }
+
+    private TurnDelivery GetTurnDelivery(
+        Guid sessionId,
+        Guid turnId,
+        Guid deliveryId)
+    {
+        GetPendingTurn(sessionId, turnId);
+        if (!_turnDeliveries.TryGetValue(deliveryId, out var delivery) ||
+            delivery.SessionId != sessionId ||
+            delivery.TurnId != turnId)
+        {
+            throw new KeyNotFoundException(
+                $"Turn delivery '{deliveryId}' was not found.");
+        }
+
+        return delivery;
+    }
+
+    private void EnsureMatchesPendingTurn(Message message)
+    {
+        if (!_pendingTurns.TryGetValue(message.Id, out var turn) ||
+            turn.SessionId != message.SessionId ||
+            turn.ParticipantId != message.AuthorId ||
+            message.RecipientId is not null ||
+            message.Direction != MessageDirection.ParticipantToMediator ||
+            !string.Equals(turn.Text, message.Text, StringComparison.Ordinal) ||
+            turn.CreatedAt != message.CreatedAt)
+        {
+            throw new InvalidOperationException(
+                $"Message '{message.Id}' conflicts with its pending turn.");
+        }
+    }
+
+    private static void EnsureSameMessage(Message existing, Message candidate)
+    {
+        if (existing.SessionId != candidate.SessionId ||
+            existing.AuthorId != candidate.AuthorId ||
+            existing.RecipientId != candidate.RecipientId ||
+            existing.Direction != candidate.Direction ||
+            !string.Equals(existing.Text, candidate.Text, StringComparison.Ordinal) ||
+            existing.CreatedAt != candidate.CreatedAt)
+        {
+            throw new InvalidOperationException(
+                $"Message '{candidate.Id}' already exists with different content.");
+        }
+    }
+
+    private static void ValidateDeliveryPlan(TurnDeliveryPlan plan)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(plan.DeliveryKey);
+        ArgumentException.ThrowIfNullOrWhiteSpace(plan.ActionType);
+        if (plan.Chunks.Count == 0 ||
+            plan.Chunks.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new ArgumentException(
+                "A delivery plan must contain non-empty chunks.",
+                nameof(plan));
+        }
+    }
+
+    private static void EnsureSameDeliveryPlan(
+        IReadOnlyList<TurnDelivery> existing,
+        TurnDeliveryPlan plan)
+    {
+        if (existing.Count != plan.Chunks.Count ||
+            existing.Any(delivery =>
+                delivery.SessionId != plan.SessionId ||
+                delivery.ParticipantId != plan.ParticipantId ||
+                delivery.ChunkCount != plan.Chunks.Count ||
+                delivery.ActionType != plan.ActionType ||
+                delivery.DisclosureDecision != plan.DisclosureDecision ||
+                !string.Equals(
+                    delivery.Text,
+                    plan.Chunks[delivery.ChunkIndex - 1],
+                    StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                $"Delivery plan '{plan.DeliveryKey}' conflicts with persisted deliveries.");
+        }
+    }
+
+    private static void EnsureSameRequestIdentity(
+        MediatedRequest existing,
+        MediatedRequest candidate)
+    {
+        if (existing.Id != candidate.Id ||
+            existing.SessionId != candidate.SessionId ||
+            existing.RequesterId != candidate.RequesterId ||
+            existing.RespondentId != candidate.RespondentId ||
+            !string.Equals(existing.Summary, candidate.Summary, StringComparison.Ordinal) ||
+            existing.CreatedAt != candidate.CreatedAt)
+        {
+            throw new InvalidOperationException(
+                $"Mediated request '{candidate.Id}' already exists with different data.");
         }
     }
 

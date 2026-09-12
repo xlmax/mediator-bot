@@ -23,13 +23,34 @@ public sealed class MediationService
         _logger = logger ?? NullLogger<MediationService>.Instance;
     }
 
+    public Task<IReadOnlyList<MediatorAction>> HandleMessageAsync(
+        Guid sessionId,
+        Guid participantId,
+        string text,
+        CancellationToken cancellationToken = default) =>
+        HandleMessageAsync(
+            sessionId,
+            participantId,
+            text,
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow,
+            cancellationToken);
+
     public async Task<IReadOnlyList<MediatorAction>> HandleMessageAsync(
         Guid sessionId,
         Guid participantId,
         string text,
+        Guid incomingMessageId,
+        DateTimeOffset createdAt,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        if (incomingMessageId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "Incoming message id must be non-empty.",
+                nameof(incomingMessageId));
+        }
 
         var startedAt = Stopwatch.GetTimestamp();
         Guid? messageId = null;
@@ -41,13 +62,13 @@ public sealed class MediationService
             var author = session.GetParticipant(participantId);
 
             var incomingMessage = new Message(
-                Guid.NewGuid(),
+                incomingMessageId,
                 session.Id,
                 author.Id,
                 null,
                 MessageDirection.ParticipantToMediator,
                 text,
-                DateTimeOffset.UtcNow);
+                createdAt);
             messageId = incomingMessage.Id;
 
             await _conversationStore.SaveMessageAsync(incomingMessage, cancellationToken);

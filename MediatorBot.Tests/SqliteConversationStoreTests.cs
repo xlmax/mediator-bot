@@ -175,6 +175,8 @@ public sealed class SqliteConversationStoreTests
         await store.CreateAsync(request);
         Assert.Empty(await store.GetOpenAsync(session.Id));
         await store.MarkAwaitingResponseAsync(session.Id, request.Id);
+        await store.CreateAsync(request);
+        await store.MarkAwaitingResponseAsync(session.Id, request.Id);
 
         var restartedStore = database.CreateStore();
         var restored = Assert.Single(await restartedStore.GetOpenAsync(session.Id));
@@ -187,6 +189,11 @@ public sealed class SqliteConversationStoreTests
             request.Id,
             MediatedRequestStatus.Declined,
             DateTimeOffset.UtcNow);
+        await restartedStore.ResolveAsync(
+            session.Id,
+            request.Id,
+            MediatedRequestStatus.Declined,
+            DateTimeOffset.UtcNow.AddMinutes(1));
 
         Assert.Empty(await database.CreateStore().GetOpenAsync(session.Id));
     }
@@ -244,6 +251,50 @@ public sealed class SqliteConversationStoreTests
             "telegram",
             session.Id,
             "42"));
+    }
+
+    [Fact]
+    public async Task PendingTurnIncomingMessage_IsRecordedIdempotently()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, _) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        var turn = new PendingExternalTurn(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            "telegram",
+            "incoming-1",
+            1,
+            "10001",
+            "Один раз",
+            DateTimeOffset.UtcNow);
+        Assert.True(await store.TryEnqueueAsync(turn));
+        var incoming = new Message(
+            turn.Id,
+            session.Id,
+            participantA.Id,
+            null,
+            MessageDirection.ParticipantToMediator,
+            turn.Text,
+            turn.CreatedAt);
+
+        await store.SaveMessageAsync(incoming);
+        await database.CreateStore().SaveMessageAsync(incoming);
+
+        Assert.Equal(incoming, Assert.Single(
+            await database.CreateStore().GetHistoryAsync(session.Id)));
+        var conflicting = new Message(
+            incoming.Id,
+            incoming.SessionId,
+            incoming.AuthorId,
+            incoming.RecipientId,
+            incoming.Direction,
+            "Другое",
+            incoming.CreatedAt);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            database.CreateStore().SaveMessageAsync(conflicting));
     }
 
     [Fact]
@@ -362,6 +413,133 @@ public sealed class SqliteConversationStoreTests
     }
 
     [Fact]
+    public async Task VersionSixDatabase_IsMigratedSequentiallyWithoutLosingPendingTurn()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, _) = CreateSession();
+        var originalStore = database.CreateStore();
+        await originalStore.CreateSessionAsync(session);
+        var turn = new PendingExternalTurn(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            "telegram",
+            "migration-42",
+            42,
+            "10001",
+            "Сохранённый до миграции turn",
+            DateTimeOffset.UtcNow);
+        Assert.True(await originalStore.TryEnqueueAsync(turn));
+
+        await ExecuteDirectAsync(
+            database.Path,
+            """
+            DROP TABLE TurnDeliveries;
+            ALTER TABLE PendingTurns DROP COLUMN ModelResultJson;
+            ALTER TABLE PendingTurns DROP COLUMN IncomingRecordedAt;
+            PRAGMA user_version = 6;
+            """);
+
+        var migratedStore = database.CreateStore();
+        await migratedStore.InitializeAsync();
+        Assert.Equal(turn, Assert.Single(await migratedStore.GetPendingAsync(session.Id)));
+        await migratedStore.SaveModelResultAsync(
+            session.Id,
+            turn.Id,
+            new MediatorActionSerializer().Serialize([new NoAction()]));
+        Assert.NotNull(await migratedStore.GetModelResultAsync(session.Id, turn.Id));
+    }
+
+    [Fact]
+    public async Task DatabaseWithNewerSchemaVersion_IsRejected()
+    {
+        using var database = new TemporaryDatabase();
+        await database.CreateStore().InitializeAsync();
+        await ExecuteDirectAsync(database.Path, "PRAGMA user_version = 999;");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            database.CreateStore().InitializeAsync());
+        Assert.Contains("newer than supported version", exception.Message);
+    }
+
+    [Fact]
+    public async Task DeliveryPlanAndModelResult_SurviveRestartAndFormOneLogicalMessage()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, _) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        var turn = new PendingExternalTurn(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            "telegram",
+            "delivery-1",
+            1,
+            "10001",
+            "input",
+            DateTimeOffset.UtcNow);
+        Assert.True(await store.TryEnqueueAsync(turn));
+        var serializedResult = new MediatorActionSerializer().Serialize([
+            new SendToParticipant(
+                participantA.Id,
+                "abcdef",
+                DisclosureDecision.PrivateResponse)
+        ]);
+        await store.SaveModelResultAsync(session.Id, turn.Id, serializedResult);
+        var plan = new TurnDeliveryPlan(
+            turn.Id,
+            session.Id,
+            participantA.Id,
+            "0:participant",
+            ["ab", "cd", "ef"],
+            nameof(SendToParticipant),
+            DisclosureDecision.PrivateResponse,
+            turn.CreatedAt);
+        var deliveries = await store.EnsureDeliveryPlanAsync(plan);
+        await store.MarkDeliveryAttemptingAsync(
+            session.Id,
+            turn.Id,
+            deliveries[0].Id,
+            DateTimeOffset.UtcNow);
+        await store.RecordDeliveryAsync(
+            session.Id,
+            turn.Id,
+            deliveries[0].Id,
+            DateTimeOffset.UtcNow);
+
+        var restartedStore = database.CreateStore();
+        Assert.Equal(
+            serializedResult,
+            await restartedStore.GetModelResultAsync(session.Id, turn.Id));
+        var restored = await restartedStore.EnsureDeliveryPlanAsync(plan);
+        Assert.Equal(TurnDeliveryStatus.Delivered, restored[0].Status);
+        Assert.All(restored.Skip(1), delivery =>
+            Assert.Equal(TurnDeliveryStatus.Pending, delivery.Status));
+        Assert.Equal(
+            "ab",
+            Assert.Single(await restartedStore.GetHistoryAsync(session.Id)).Text);
+
+        foreach (var delivery in restored.Skip(1))
+        {
+            await restartedStore.MarkDeliveryAttemptingAsync(
+                session.Id,
+                turn.Id,
+                delivery.Id,
+                DateTimeOffset.UtcNow);
+            await restartedStore.RecordDeliveryAsync(
+                session.Id,
+                turn.Id,
+                delivery.Id,
+                DateTimeOffset.UtcNow);
+        }
+
+        var outgoing = Assert.Single(await restartedStore.GetHistoryAsync(session.Id));
+        Assert.Equal("abcdef", outgoing.Text);
+        Assert.Equal(deliveries[0].LogicalMessageId, outgoing.Id);
+    }
+
+    [Fact]
     public async Task DatabaseFile_IsEncryptedAndCannotBeOpenedWithoutKey()
     {
         using var database = new TemporaryDatabase();
@@ -383,6 +561,28 @@ public sealed class SqliteConversationStoreTests
         var storeWithWrongKey = new SqliteConversationStore(
             new SqliteConversationStoreOptions(database.Path, "wrong-key"));
         await Assert.ThrowsAsync<SqliteException>(() => storeWithWrongKey.InitializeAsync());
+    }
+
+    private static async Task ExecuteDirectAsync(string path, string sql)
+    {
+        SqliteConnection.ClearAllPools();
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false
+        }.ToString();
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        await using (var keyCommand = connection.CreateCommand())
+        {
+            keyCommand.CommandText = "PRAGMA key = 'integration-test-key';";
+            await keyCommand.ExecuteNonQueryAsync();
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
     }
 
     private static (Session Session, Participant ParticipantA, Participant ParticipantB) CreateSession()

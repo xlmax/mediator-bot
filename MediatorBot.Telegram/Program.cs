@@ -40,7 +40,7 @@ var participantBUserId = builder.Configuration.GetValue<long>(
 var participantBDisplayName = builder.Configuration[
     "Telegram:ParticipantBDisplayName"] ?? "B";
 var maxHistoryMessages = builder.Configuration.GetValue<int?>(
-    "Storage:MaxHistoryMessages") ?? 100;
+    "Storage:MaxHistoryMessages") ?? 200;
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHistoryMessages);
 var deliveryTimeoutSeconds = builder.Configuration.GetValue<int?>(
     "Telegram:DeliveryTimeoutSeconds") ?? 30;
@@ -56,13 +56,13 @@ var compactionOptions = new ConversationCompactionOptions
 {
     Enabled = compactionConfigured &&
         modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase),
-    TriggerMessageCount = GetPositiveInt("Compaction:TriggerMessageCount", 100),
+    TriggerMessageCount = GetPositiveInt("Compaction:TriggerMessageCount", 200),
     TriggerHistoryCharacters = GetPositiveInt(
         "Compaction:TriggerHistoryCharacters",
         50_000),
     RetainRecentMessageCount = GetPositiveInt(
         "Compaction:RetainRecentMessageCount",
-        40),
+        80),
     RetainRecentCharacters = GetPositiveInt(
         "Compaction:RetainRecentCharacters",
         20_000),
@@ -88,6 +88,8 @@ builder.Services.AddSingleton<IExternalUpdateStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IExternalTurnQueueStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<ITurnExecutionStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IMediatedRequestStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IConversationCompactionStore>(services =>
@@ -99,7 +101,7 @@ builder.Services.AddSingleton<IConversationContextBuilder>(services =>
         services.GetRequiredService<IMediatedRequestStore>(),
         maxHistoryMessages,
         services.GetRequiredService<IConversationCompactionStore>()));
-builder.Services.AddSingleton<IMediatorDeliveryRecorder, MediatorDeliveryRecorder>();
+builder.Services.AddSingleton<MediatorActionSerializer>();
 builder.Services.AddSingleton<ISessionTurnCoordinator, SessionTurnCoordinator>();
 builder.Services.AddSingleton<MediationService>();
 

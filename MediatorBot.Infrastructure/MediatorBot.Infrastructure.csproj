@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Persistence\Schema.sql" />
+    <EmbeddedResource Include="Persistence\Migrations\*.sql" />
   </ItemGroup>
 
   <PropertyGroup>

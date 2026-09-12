@@ -10,6 +10,8 @@ public sealed class TelegramQueuedTurnProcessor(
     TelegramParticipantRegistry participantRegistry,
     MediationService mediationService,
     TelegramMediatorActionDispatcher actionDispatcher,
+    ITurnExecutionStore turnExecutionStore,
+    MediatorActionSerializer actionSerializer,
     TelegramAdapterOptions options,
     ILogger<TelegramQueuedTurnProcessor> logger) : ITelegramQueuedTurnProcessor
 {
@@ -33,9 +35,8 @@ public sealed class TelegramQueuedTurnProcessor(
                 $"Pending Telegram turn '{turn.Id}' does not match configured participants.");
         }
 
-        var turnId = Guid.NewGuid();
         var startedAt = Stopwatch.GetTimestamp();
-        using var scope = logger.BeginScope("MediatorTurn {TurnId}", turnId);
+        using var scope = logger.BeginScope("MediatorTurn {TurnId}", turn.Id);
 
         logger.LogInformation(
             "Turn started. UpdateId={UpdateId} TelegramUserId={TelegramUserId} " +
@@ -48,14 +49,39 @@ public sealed class TelegramQueuedTurnProcessor(
 
         try
         {
-            var actions = await mediationService.HandleMessageAsync(
+            var persistedModelResult = await turnExecutionStore.GetModelResultAsync(
                 binding.Session.Id,
-                binding.Participant.Id,
-                turn.Text,
+                turn.Id,
                 cancellationToken);
+            IReadOnlyList<MediatorAction> actions;
+            if (persistedModelResult is null)
+            {
+                actions = await mediationService.HandleMessageAsync(
+                    binding.Session.Id,
+                    binding.Participant.Id,
+                    turn.Text,
+                    turn.Id,
+                    turn.CreatedAt,
+                    cancellationToken);
+                persistedModelResult = actionSerializer.Serialize(actions);
+                await turnExecutionStore.SaveModelResultAsync(
+                    binding.Session.Id,
+                    turn.Id,
+                    persistedModelResult,
+                    cancellationToken);
+            }
+            else
+            {
+                actions = actionSerializer.Deserialize(persistedModelResult);
+                logger.LogInformation(
+                    "Persisted model result reused during turn recovery. " +
+                    "UpdateId={UpdateId} SessionId={SessionId}",
+                    updateId,
+                    binding.Session.Id);
+            }
+
             await actionDispatcher.DispatchAsync(
-                updateId,
-                telegramUserId,
+                turn,
                 binding.Session,
                 actions,
                 cancellationToken);

@@ -14,5 +14,5 @@ public sealed class TelegramSessionInitializer(
     }
 
     public Task StopAsync(CancellationToken cancellationToken) =>
-        Task.CompletedTask;
+        workQueue.StopAsync(cancellationToken);
 }
