@@ -9,4 +9,5 @@ public sealed record PendingExternalTurn(
     long SourceSequence,
     string ExternalUserId,
     string Text,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    int AttemptCount = 0);

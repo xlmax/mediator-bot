@@ -10,7 +10,9 @@ public enum TelegramMessageProcessingStatus
     Duplicate,
     UnknownUser,
     ModelUnavailable,
-    ModelProtocolFailure
+    ModelProtocolFailure,
+    Deferred,
+    ProcessingFailed
 }
 
 public sealed class TelegramMessageProcessor(

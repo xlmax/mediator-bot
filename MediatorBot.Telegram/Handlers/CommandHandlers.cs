@@ -25,6 +25,17 @@ public sealed class CommandHandlers(TelegramCommandService commandService)
         await context.Message.AnswerAsync(response.Text, cancellationToken);
     }
 
+    [Command("retry_failed")]
+    public async Task RetryFailedAsync(
+        MessageContext context,
+        CancellationToken cancellationToken)
+    {
+        var response = await commandService.RetryFailedAsync(
+            GetTelegramUserId(context),
+            cancellationToken);
+        await context.Message.AnswerAsync(response.Text, cancellationToken);
+    }
+
     [Command("help")]
     public async Task HelpAsync(MessageContext context, CancellationToken cancellationToken)
     {

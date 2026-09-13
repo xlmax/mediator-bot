@@ -419,6 +419,16 @@ public sealed class SqliteConversationStoreTests
         var (session, participantA, _) = CreateSession();
         var originalStore = database.CreateStore();
         await originalStore.CreateSessionAsync(session);
+        await originalStore.SaveMessageAsync(Incoming(
+            session,
+            participantA,
+            "old-1",
+            DateTimeOffset.UtcNow.AddMinutes(-2)));
+        await originalStore.SaveMessageAsync(Incoming(
+            session,
+            participantA,
+            "old-2",
+            DateTimeOffset.UtcNow.AddMinutes(-1)));
         var turn = new PendingExternalTurn(
             Guid.NewGuid(),
             session.Id,
@@ -430,11 +440,26 @@ public sealed class SqliteConversationStoreTests
             "Сохранённый до миграции turn",
             DateTimeOffset.UtcNow);
         Assert.True(await originalStore.TryEnqueueAsync(turn));
+        var legacyMessage = new Message(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            null,
+            MessageDirection.ParticipantToMediator,
+            turn.Text,
+            turn.CreatedAt.AddMilliseconds(1));
+        await originalStore.SaveMessageAsync(legacyMessage);
 
         await ExecuteDirectAsync(
             database.Path,
             """
             DROP TABLE TurnDeliveries;
+            DROP INDEX IX_PendingTurns_SessionId_Status_Order;
+            ALTER TABLE PendingTurns DROP COLUMN FailureType;
+            ALTER TABLE PendingTurns DROP COLUMN FailedAt;
+            ALTER TABLE PendingTurns DROP COLUMN LastAttemptAt;
+            ALTER TABLE PendingTurns DROP COLUMN AttemptCount;
+            ALTER TABLE PendingTurns DROP COLUMN Status;
             ALTER TABLE PendingTurns DROP COLUMN ModelResultJson;
             ALTER TABLE PendingTurns DROP COLUMN IncomingRecordedAt;
             PRAGMA user_version = 6;
@@ -443,11 +468,125 @@ public sealed class SqliteConversationStoreTests
         var migratedStore = database.CreateStore();
         await migratedStore.InitializeAsync();
         Assert.Equal(turn, Assert.Single(await migratedStore.GetPendingAsync(session.Id)));
+        var compactionBatch = await migratedStore.GetCompactionBatchAsync(
+            session.Id,
+            triggerMessageCount: 2,
+            triggerCharacterCount: 10_000,
+            retainRecentMessageCount: 1,
+            retainRecentCharacterCount: 5_000);
+        Assert.NotNull(compactionBatch);
+        Assert.DoesNotContain(
+            compactionBatch.Messages,
+            message => message.Message.Id == legacyMessage.Id);
+        await migratedStore.CommitCompactionAsync(
+            session.Id,
+            compactionBatch.ExpectedSummaryVersion,
+            compactionBatch.CompactedThroughSequence,
+            new ConversationSummaryContent("", "", "", ""),
+            DateTimeOffset.UtcNow);
+
+        await migratedStore.SaveMessageAsync(new Message(
+            turn.Id,
+            session.Id,
+            participantA.Id,
+            null,
+            MessageDirection.ParticipantToMediator,
+            turn.Text,
+            turn.CreatedAt));
+        var migratedHistory = await migratedStore.GetHistoryAsync(session.Id);
+        var migratedIncoming = Assert.Single(
+            migratedHistory,
+            message => message.Text == turn.Text);
+        Assert.Equal(turn.Id, migratedIncoming.Id);
+
+        Assert.Equal(1, await migratedStore.BeginAttemptAsync(
+            session.Id,
+            turn.Id,
+            DateTimeOffset.UtcNow));
+        await migratedStore.MarkFailedAsync(
+            session.Id,
+            turn.Id,
+            "TestFailure",
+            DateTimeOffset.UtcNow);
+        Assert.Empty(await migratedStore.GetPendingAsync(session.Id));
+        Assert.Equal(1, await migratedStore.GetFailedCountAsync(
+            session.Id,
+            participantA.Id));
+        Assert.Equal(1, await migratedStore.RetryFailedAsync(
+            session.Id,
+            participantA.Id));
+        var retried = Assert.Single(await migratedStore.GetPendingAsync(session.Id));
+        Assert.Equal(0, retried.AttemptCount);
+
         await migratedStore.SaveModelResultAsync(
             session.Id,
             turn.Id,
             new MediatorActionSerializer().Serialize([new NoAction()]));
         Assert.NotNull(await migratedStore.GetModelResultAsync(session.Id, turn.Id));
+    }
+
+    [Fact]
+    public async Task VersionSevenDatabase_IsMigratedWithoutLosingExecutionCheckpoints()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, _) = CreateSession();
+        var originalStore = database.CreateStore();
+        await originalStore.CreateSessionAsync(session);
+        var turn = new PendingExternalTurn(
+            Guid.NewGuid(),
+            session.Id,
+            participantA.Id,
+            "telegram",
+            "migration-v7",
+            43,
+            "10001",
+            "Pending v7 turn",
+            DateTimeOffset.UtcNow);
+        Assert.True(await originalStore.TryEnqueueAsync(turn));
+        var modelResult = new MediatorActionSerializer().Serialize([new NoAction()]);
+        await originalStore.SaveModelResultAsync(session.Id, turn.Id, modelResult);
+        var plan = new TurnDeliveryPlan(
+            turn.Id,
+            session.Id,
+            participantA.Id,
+            "migration-v7-delivery",
+            ["saved delivery"],
+            nameof(SendToParticipant),
+            DisclosureDecision.PrivateResponse,
+            turn.CreatedAt);
+        var delivery = Assert.Single(await originalStore.EnsureDeliveryPlanAsync(plan));
+        await originalStore.MarkDeliveryAttemptingAsync(
+            session.Id,
+            turn.Id,
+            delivery.Id,
+            DateTimeOffset.UtcNow);
+
+        await ExecuteDirectAsync(
+            database.Path,
+            """
+            DROP INDEX IX_PendingTurns_SessionId_Status_Order;
+            ALTER TABLE PendingTurns DROP COLUMN FailureType;
+            ALTER TABLE PendingTurns DROP COLUMN FailedAt;
+            ALTER TABLE PendingTurns DROP COLUMN LastAttemptAt;
+            ALTER TABLE PendingTurns DROP COLUMN AttemptCount;
+            ALTER TABLE PendingTurns DROP COLUMN Status;
+            PRAGMA user_version = 7;
+            """);
+
+        var migratedStore = database.CreateStore();
+        await migratedStore.InitializeAsync();
+
+        Assert.Equal(turn, Assert.Single(await migratedStore.GetPendingAsync(session.Id)));
+        Assert.Equal(modelResult, await migratedStore.GetModelResultAsync(
+            session.Id,
+            turn.Id));
+        Assert.Equal(
+            TurnDeliveryStatus.Attempting,
+            Assert.Single(await migratedStore.EnsureDeliveryPlanAsync(plan)).Status);
+        Assert.Equal(1, await migratedStore.BeginAttemptAsync(
+            session.Id,
+            turn.Id,
+            DateTimeOffset.UtcNow));
     }
 
     [Fact]
@@ -512,7 +651,9 @@ public sealed class SqliteConversationStoreTests
         Assert.Equal(
             serializedResult,
             await restartedStore.GetModelResultAsync(session.Id, turn.Id));
-        var restored = await restartedStore.EnsureDeliveryPlanAsync(plan);
+        var rechunkedPlan = plan with { Chunks = ["abc", "def"] };
+        var restored = await restartedStore.EnsureDeliveryPlanAsync(rechunkedPlan);
+        Assert.Equal(3, restored.Count);
         Assert.Equal(TurnDeliveryStatus.Delivered, restored[0].Status);
         Assert.All(restored.Skip(1), delivery =>
             Assert.Equal(TurnDeliveryStatus.Pending, delivery.Status));

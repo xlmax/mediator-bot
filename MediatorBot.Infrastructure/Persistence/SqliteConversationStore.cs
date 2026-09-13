@@ -17,7 +17,7 @@ public sealed class SqliteConversationStore :
     IConversationCompactionStore
 {
     private const int BaseSchemaVersion = 4;
-    private const int CurrentSchemaVersion = 7;
+    private const int CurrentSchemaVersion = 8;
     private const string SchemaResourceName =
         "MediatorBot.Infrastructure.Persistence.Schema.sql";
 
@@ -25,7 +25,8 @@ public sealed class SqliteConversationStore :
     [
         (5, "MediatorBot.Infrastructure.Persistence.Migrations.005_AddConversationSummaries.sql"),
         (6, "MediatorBot.Infrastructure.Persistence.Migrations.006_AddPendingTurns.sql"),
-        (7, "MediatorBot.Infrastructure.Persistence.Migrations.007_AddReliableTurnExecution.sql")
+        (7, "MediatorBot.Infrastructure.Persistence.Migrations.007_AddReliableTurnExecution.sql"),
+        (8, "MediatorBot.Infrastructure.Persistence.Migrations.008_AddFailedTurnQuarantine.sql")
     ];
 
     private static readonly Lazy<bool> SqliteRuntime = new(() =>
@@ -177,6 +178,17 @@ public sealed class SqliteConversationStore :
             EnsureMatchesPendingTurn(message, pendingTurn);
             await transaction.CommitAsync(cancellationToken);
             return;
+        }
+
+        if (pendingTurn is not null)
+        {
+            EnsureMatchesPendingTurn(message, pendingTurn);
+            await RebindLegacyIncomingMessageAsync(
+                connection,
+                transaction,
+                message,
+                pendingTurn,
+                cancellationToken);
         }
 
         var affectedRows = await connection.ExecuteAsync(new CommandDefinition(
@@ -532,14 +544,130 @@ public sealed class SqliteConversationStore :
         var rows = await connection.QueryAsync<PendingExternalTurnRow>(new CommandDefinition(
             """
             SELECT Id, SessionId, ParticipantId, Source, ExternalUpdateId,
-                   SourceSequence, ExternalUserId, Text, CreatedAt
+                   SourceSequence, ExternalUserId, Text, CreatedAt, AttemptCount
             FROM PendingTurns
             WHERE SessionId = @SessionId
+              AND Status = 'Pending'
             ORDER BY SourceSequence, CreatedAt, Id;
             """,
             new { SessionId = Format(sessionId) },
             cancellationToken: cancellationToken));
         return rows.Select(ToPendingExternalTurn).ToArray();
+    }
+
+    public async Task<int> BeginAttemptAsync(
+        Guid sessionId,
+        Guid turnId,
+        DateTimeOffset attemptedAt,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var attemptCount = await connection.QuerySingleOrDefaultAsync<int?>(
+            new CommandDefinition(
+                """
+                UPDATE PendingTurns
+                SET AttemptCount = AttemptCount + 1,
+                    LastAttemptAt = @AttemptedAt
+                WHERE SessionId = @SessionId
+                  AND Id = @TurnId
+                  AND Status = 'Pending'
+                RETURNING AttemptCount;
+                """,
+                new
+                {
+                    SessionId = Format(sessionId),
+                    TurnId = Format(turnId),
+                    AttemptedAt = Format(attemptedAt)
+                },
+                cancellationToken: cancellationToken));
+        return attemptCount ?? throw new KeyNotFoundException(
+            $"Pending turn '{turnId}' was not found in session '{sessionId}'.");
+    }
+
+    public async Task MarkFailedAsync(
+        Guid sessionId,
+        Guid turnId,
+        string failureType,
+        DateTimeOffset failedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(failureType);
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var affectedRows = await connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE PendingTurns
+            SET Status = 'Failed',
+                FailedAt = @FailedAt,
+                FailureType = @FailureType
+            WHERE SessionId = @SessionId
+              AND Id = @TurnId
+              AND Status = 'Pending';
+            """,
+            new
+            {
+                SessionId = Format(sessionId),
+                TurnId = Format(turnId),
+                FailedAt = Format(failedAt),
+                FailureType = failureType
+            },
+            cancellationToken: cancellationToken));
+        if (affectedRows != 1)
+        {
+            throw new KeyNotFoundException(
+                $"Pending turn '{turnId}' was not found in session '{sessionId}'.");
+        }
+    }
+
+    public async Task<int> GetFailedCountAsync(
+        Guid sessionId,
+        Guid participantId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        return await connection.ExecuteScalarAsync<int>(new CommandDefinition(
+            """
+            SELECT COUNT(*)
+            FROM PendingTurns
+            WHERE SessionId = @SessionId
+              AND ParticipantId = @ParticipantId
+              AND Status = 'Failed';
+            """,
+            new
+            {
+                SessionId = Format(sessionId),
+                ParticipantId = Format(participantId)
+            },
+            cancellationToken: cancellationToken));
+    }
+
+    public async Task<int> RetryFailedAsync(
+        Guid sessionId,
+        Guid participantId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        return await connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE PendingTurns
+            SET Status = 'Pending',
+                AttemptCount = 0,
+                LastAttemptAt = NULL,
+                FailedAt = NULL,
+                FailureType = NULL
+            WHERE SessionId = @SessionId
+              AND ParticipantId = @ParticipantId
+              AND Status = 'Failed';
+            """,
+            new
+            {
+                SessionId = Format(sessionId),
+                ParticipantId = Format(participantId)
+            },
+            cancellationToken: cancellationToken));
     }
 
     public async Task CompleteAsync(
@@ -1091,18 +1219,36 @@ public sealed class SqliteConversationStore :
             WHERE SessionId = @SessionId
             ORDER BY Sequence;
 
-            SELECT Id
+            SELECT Id, ParticipantId, Text, CreatedAt, IncomingRecordedAt
             FROM PendingTurns
             WHERE SessionId = @SessionId
-              AND IncomingRecordedAt IS NOT NULL;
+              AND Status = 'Pending';
             """,
             new { SessionId = Format(sessionId) },
             cancellationToken: cancellationToken));
 
         var summaryRow = await result.ReadSingleOrDefaultAsync<ConversationSummaryRow>();
         var messageRows = (await result.ReadAsync<MessageRow>()).ToArray();
-        var pendingMessageIds = (await result.ReadAsync<string>()).ToHashSet(
-            StringComparer.Ordinal);
+        var pendingRows = (await result.ReadAsync<PendingCompactionRow>()).ToArray();
+        var pendingMessageIds = pendingRows
+            .Select(row => row.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var pendingRow in pendingRows.Where(row =>
+                     row.IncomingRecordedAt is null))
+        {
+            var legacyMessage = messageRows.FirstOrDefault(messageRow =>
+                messageRow.AuthorId == pendingRow.ParticipantId &&
+                messageRow.RecipientId is null &&
+                messageRow.Direction == nameof(MessageDirection.ParticipantToMediator) &&
+                string.Equals(messageRow.Text, pendingRow.Text, StringComparison.Ordinal) &&
+                ParseTimestamp(messageRow.CreatedAt) >=
+                ParseTimestamp(pendingRow.CreatedAt));
+            if (legacyMessage is not null)
+            {
+                pendingMessageIds.Add(legacyMessage.Id);
+            }
+        }
+
         var firstPendingIndex = Array.FindIndex(messageRows, row =>
             pendingMessageIds.Contains(row.Id));
         if (firstPendingIndex >= 0)
@@ -1481,17 +1627,16 @@ public sealed class SqliteConversationStore :
         IReadOnlyList<TurnDelivery> existing,
         TurnDeliveryPlan plan)
     {
-        if (existing.Count != plan.Chunks.Count ||
-            existing.Any(delivery =>
+        if (existing.Any(delivery =>
                 delivery.SessionId != plan.SessionId ||
                 delivery.ParticipantId != plan.ParticipantId ||
-                delivery.ChunkCount != plan.Chunks.Count ||
+                delivery.ChunkCount != existing.Count ||
                 delivery.ActionType != plan.ActionType ||
-                delivery.DisclosureDecision != plan.DisclosureDecision ||
-                !string.Equals(
-                    delivery.Text,
-                    plan.Chunks[delivery.ChunkIndex - 1],
-                    StringComparison.Ordinal)))
+                delivery.DisclosureDecision != plan.DisclosureDecision) ||
+            !string.Equals(
+                string.Concat(existing.Select(delivery => delivery.Text)),
+                string.Concat(plan.Chunks),
+                StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 $"Delivery plan '{plan.DeliveryKey}' conflicts with persisted deliveries.");
@@ -1544,6 +1689,60 @@ public sealed class SqliteConversationStore :
         message.Text,
         CreatedAt = Format(message.CreatedAt)
     };
+
+    private static async Task RebindLegacyIncomingMessageAsync(
+        SqliteConnection connection,
+        DbTransaction transaction,
+        Message message,
+        PendingIncomingRow pendingTurn,
+        CancellationToken cancellationToken)
+    {
+        var legacySequence = await connection.QuerySingleOrDefaultAsync<long?>(
+            new CommandDefinition(
+                """
+                SELECT Sequence
+                FROM Messages
+                WHERE Id <> @Id
+                  AND SessionId = @SessionId
+                  AND AuthorId = @AuthorId
+                  AND RecipientId IS NULL
+                  AND Direction = 'ParticipantToMediator'
+                  AND Text = @Text
+                  AND CreatedAt >= @TurnCreatedAt
+                ORDER BY Sequence
+                LIMIT 1;
+                """,
+                new
+                {
+                    Id = Format(message.Id),
+                    SessionId = Format(message.SessionId),
+                    AuthorId = Format(message.AuthorId),
+                    message.Text,
+                    TurnCreatedAt = pendingTurn.CreatedAt
+                },
+                transaction,
+                cancellationToken: cancellationToken));
+        if (legacySequence is null)
+        {
+            return;
+        }
+
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE Messages
+            SET Id = @Id,
+                CreatedAt = @CreatedAt
+            WHERE Sequence = @Sequence;
+            """,
+            new
+            {
+                Id = Format(message.Id),
+                CreatedAt = Format(message.CreatedAt),
+                Sequence = legacySequence.Value
+            },
+            transaction,
+            cancellationToken: cancellationToken));
+    }
 
     private static void EnsureMatchesPendingTurn(
         Message message,
@@ -1640,7 +1839,8 @@ public sealed class SqliteConversationStore :
         row.SourceSequence,
         row.ExternalUserId,
         row.Text,
-        ParseTimestamp(row.CreatedAt));
+        ParseTimestamp(row.CreatedAt),
+        row.AttemptCount);
 
     private static MediatedRequest ToMediatedRequest(MediatedRequestRow row) => new(
         Guid.Parse(row.Id),
@@ -1783,6 +1983,19 @@ public sealed class SqliteConversationStore :
         public string? IncomingRecordedAt { get; init; }
     }
 
+    private sealed class PendingCompactionRow
+    {
+        public required string Id { get; init; }
+
+        public required string ParticipantId { get; init; }
+
+        public required string Text { get; init; }
+
+        public required string CreatedAt { get; init; }
+
+        public string? IncomingRecordedAt { get; init; }
+    }
+
     private sealed class PendingExternalTurnRow
     {
         public required string Id { get; init; }
@@ -1802,6 +2015,8 @@ public sealed class SqliteConversationStore :
         public required string Text { get; init; }
 
         public required string CreatedAt { get; init; }
+
+        public int AttemptCount { get; init; }
     }
 
     private sealed class ConversationSummaryRow

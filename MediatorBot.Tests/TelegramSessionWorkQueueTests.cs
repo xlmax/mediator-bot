@@ -100,8 +100,9 @@ public sealed class TelegramSessionWorkQueueTests
             store,
             processor).Queue;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            queue.ProcessEnqueuedAsync(turn));
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await queue.ProcessEnqueuedAsync(turn));
         Assert.Single(await store.GetPendingAsync(session.Id));
 
         await queue.RecoverSessionAsync(session.Id);
@@ -109,6 +110,61 @@ public sealed class TelegramSessionWorkQueueTests
             (await store.GetPendingAsync(session.Id)).Count == 0);
 
         Assert.Equal(2, processor.AttemptCount);
+    }
+
+    [Fact]
+    public async Task PermanentFailure_IsQuarantinedAndDoesNotBlockLaterTurn()
+    {
+        var session = CreateSession();
+        var store = new InMemoryConversationStore([session]);
+        var failedTurn = CreateTurn(session, 20, 10001);
+        var laterTurn = CreateTurn(session, 21, 10002);
+        Assert.True(await store.TryEnqueueAsync(failedTurn));
+        Assert.True(await store.TryEnqueueAsync(laterTurn));
+        var processor = new BlockingFailureTurnProcessor(failedTurn.Id);
+        var queue = CreateQueue(
+            session,
+            new NoCompactionService(),
+            new ConcurrentRecordingTransport(),
+            store,
+            processor,
+            new TelegramTurnProcessingOptions
+            {
+                MaxAttempts = 1,
+                RetryDelay = TimeSpan.FromMilliseconds(20)
+            }).Queue;
+
+        var failed = queue.ProcessEnqueuedAsync(failedTurn);
+        await processor.FailureEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var later = queue.ProcessEnqueuedAsync(laterTurn);
+        processor.ReleaseFailure.TrySetResult();
+
+        Assert.Equal(
+            TelegramMessageProcessingStatus.ProcessingFailed,
+            await failed.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await later.WaitAsync(TimeSpan.FromSeconds(5)));
+        await WaitUntilAsync(() => processor.ProcessedTurnIds.Contains(laterTurn.Id));
+        await WaitUntilAsync(async () =>
+            (await store.GetPendingAsync(session.Id)).Count == 0);
+
+        Assert.Equal(
+            1,
+            await store.GetFailedCountAsync(session.Id, session.ParticipantA.Id));
+        Assert.Equal(
+            0,
+            await store.GetFailedCountAsync(session.Id, session.ParticipantB.Id));
+
+        processor.AllowFailedTurn = true;
+        Assert.Equal(
+            1,
+            await store.RetryFailedAsync(session.Id, session.ParticipantA.Id));
+        await queue.RecoverSessionAsync(session.Id);
+        await WaitUntilAsync(async () =>
+            await store.GetFailedCountAsync(session.Id, session.ParticipantA.Id) == 0 &&
+            (await store.GetPendingAsync(session.Id)).Count == 0);
+        Assert.Contains(failedTurn.Id, processor.ProcessedTurnIds);
     }
 
     [Fact]
@@ -134,8 +190,9 @@ public sealed class TelegramSessionWorkQueueTests
 
         var second = CreateTurn(session, 9, 10002);
         Assert.True(await store.TryEnqueueAsync(second));
-        await Assert.ThrowsAsync<OperationCanceledException>(() =>
-            queue.ProcessEnqueuedAsync(second));
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await queue.ProcessEnqueuedAsync(second));
 
         processor.Release.TrySetResult();
         Assert.Equal(
@@ -176,7 +233,8 @@ public sealed class TelegramSessionWorkQueueTests
         IConversationCompactionService compactionService,
         ITelegramMessageTransport transport,
         InMemoryConversationStore? store = null,
-        ITelegramQueuedTurnProcessor? processor = null)
+        ITelegramQueuedTurnProcessor? processor = null,
+        TelegramTurnProcessingOptions? turnProcessingOptions = null)
     {
         store ??= new InMemoryConversationStore([session]);
         processor ??= new RecordingTurnProcessor();
@@ -195,6 +253,11 @@ public sealed class TelegramSessionWorkQueueTests
                 DeliveryTimeout = TimeSpan.FromSeconds(2)
             },
             CompactionOptions(),
+            turnProcessingOptions ?? new TelegramTurnProcessingOptions
+            {
+                MaxAttempts = 3,
+                RetryDelay = TimeSpan.FromMilliseconds(20)
+            },
             NullLogger<TelegramSessionWorkQueue>.Instance);
         return new QueueFixture(queue, store, processor);
     }
@@ -327,6 +390,37 @@ public sealed class TelegramSessionWorkQueueTests
             }
 
             return Task.FromResult(TelegramMessageProcessingStatus.Processed);
+        }
+    }
+
+    private sealed class BlockingFailureTurnProcessor(Guid failedTurnId)
+        : ITelegramQueuedTurnProcessor
+    {
+        private readonly ConcurrentQueue<Guid> _processedTurnIds = [];
+
+        public TaskCompletionSource FailureEntered { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ReleaseFailure { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool AllowFailedTurn { get; set; }
+
+        public IReadOnlyCollection<Guid> ProcessedTurnIds => _processedTurnIds.ToArray();
+
+        public async Task<TelegramMessageProcessingStatus> ProcessAsync(
+            PendingExternalTurn turn,
+            CancellationToken cancellationToken = default)
+        {
+            if (turn.Id == failedTurnId && !AllowFailedTurn)
+            {
+                FailureEntered.TrySetResult();
+                await ReleaseFailure.Task.WaitAsync(cancellationToken);
+                throw new InvalidOperationException("Permanent simulated failure.");
+            }
+
+            _processedTurnIds.Enqueue(turn.Id);
+            return TelegramMessageProcessingStatus.Processed;
         }
     }
 

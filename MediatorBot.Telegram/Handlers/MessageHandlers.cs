@@ -47,6 +47,20 @@ public sealed class PrivateMessageHandler(
                     "Не удалось корректно обработать сообщение. Попробуйте ещё раз чуть позже.",
                     cancellationToken);
             }
+            else if (status == TelegramMessageProcessingStatus.Deferred)
+            {
+                await context.Message.AnswerAsync(
+                    "Сообщение сохранено. Обработка продолжится автоматически.",
+                    cancellationToken);
+            }
+            else if (status == TelegramMessageProcessingStatus.ProcessingFailed)
+            {
+                await context.Message.AnswerAsync(
+                    "Не удалось обработать сохранённое сообщение. " +
+                    "Следующие сообщения продолжат обрабатываться. " +
+                    "Повторить попытку можно командой /retry_failed.",
+                    cancellationToken);
+            }
         }
         finally
         {

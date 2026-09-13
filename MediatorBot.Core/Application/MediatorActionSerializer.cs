@@ -41,8 +41,8 @@ public sealed class MediatorActionSerializer
             throw new InvalidDataException("Persisted mediator actions are malformed.", exception);
         }
 
-        if (envelope.Version != CurrentVersion || envelope.Actions is null ||
-            envelope.Actions.Length == 0)
+        if (envelope.Version < 1 || envelope.Version > CurrentVersion ||
+            envelope.Actions is null || envelope.Actions.Length == 0)
         {
             throw new InvalidDataException(
                 "Persisted mediator actions have an unsupported version or no actions.");

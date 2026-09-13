@@ -8,6 +8,8 @@ public sealed class TelegramCommandService(
     TelegramParticipantRegistry participantRegistry,
     IConversationStore conversationStore,
     IConversationCompactionStore compactionStore,
+    IExternalTurnQueueStore turnQueueStore,
+    TelegramSessionWorkQueue workQueue,
     TelegramAdapterOptions options)
 {
     public async Task<TelegramCommandResponse> GetStartAsync(
@@ -51,17 +53,56 @@ public sealed class TelegramCommandService(
         var summaryTask = compactionStore.GetSummaryAsync(
             binding.Session.Id,
             cancellationToken);
-        await Task.WhenAll(historyTask, summaryTask);
+        var failedCountTask = turnQueueStore.GetFailedCountAsync(
+            binding.Session.Id,
+            binding.Participant.Id,
+            cancellationToken);
+        await Task.WhenAll(historyTask, summaryTask, failedCountTask);
         var history = await historyTask;
         var summary = await summaryTask;
+        var failedCount = await failedCountTask;
         var memoryStatus = summary is null
             ? "краткая память пока не создавалась"
             : $"краткая память обновлена " +
               $"{summary.UpdatedAt.ToUniversalTime():yyyy-MM-dd HH:mm} UTC";
+        var failedStatus = failedCount == 0
+            ? "необработанных сообщений нет"
+            : $"не удалось обработать ваших сообщений: {failedCount}; " +
+              "для повторной попытки используйте /retry_failed";
         return new TelegramCommandResponse(
             true,
             $"Session активна. Модель: {options.ModelDisplayName}. " +
-            $"Свежих сообщений в общей истории: {history.Count}; {memoryStatus}.");
+            $"Свежих сообщений в общей истории: {history.Count}; {memoryStatus}; " +
+            $"{failedStatus}.");
+    }
+
+    public async Task<TelegramCommandResponse> RetryFailedAsync(
+        long telegramUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var binding = await participantRegistry.FindByTelegramUserIdAsync(
+            telegramUserId,
+            cancellationToken);
+        if (binding is null)
+        {
+            return UnknownUser();
+        }
+
+        var retried = await turnQueueStore.RetryFailedAsync(
+            binding.Session.Id,
+            binding.Participant.Id,
+            cancellationToken);
+        if (retried == 0)
+        {
+            return new TelegramCommandResponse(
+                true,
+                "У вас нет сообщений, ожидающих ручной повторной обработки.");
+        }
+
+        await workQueue.RecoverSessionAsync(binding.Session.Id, cancellationToken);
+        return new TelegramCommandResponse(
+            true,
+            "Повторная обработка сохранённых сообщений запущена.");
     }
 
     public async Task<TelegramCommandResponse> GetHelpAsync(
@@ -81,7 +122,8 @@ public sealed class TelegramCommandService(
             "Это приватный посредник для общения о взаимоотношениях двух участников. " +
             "Напишите сообщение в личном чате, и медиатор решит, кому и как ответить. " +
             "При длительном общении бот сохраняет важное в краткой памяти и удаляет " +
-            "успешно сжатые старые подробности. Команды: /start, /status, /help.");
+            "успешно сжатые старые подробности. " +
+            "Команды: /start, /status, /retry_failed, /help.");
     }
 
     private static TelegramCommandResponse UnknownUser() => new(

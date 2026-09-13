@@ -50,6 +50,12 @@ var deliveryRecordingTimeoutSeconds = builder.Configuration.GetValue<int?>(
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(deliveryRecordingTimeoutSeconds);
 var modelRuntimeName = builder.Configuration["ModelRuntime"] ?? "Fake";
 var configuredModel = builder.Configuration["OpenAI:Model"] ?? "gpt-4.1-mini";
+var turnProcessingOptions = new TelegramTurnProcessingOptions
+{
+    MaxAttempts = GetPositiveInt("TurnProcessing:MaxAttempts", 3),
+    RetryDelay = TimeSpan.FromSeconds(
+        GetPositiveInt("TurnProcessing:RetryDelaySeconds", 15))
+};
 var compactionConfigured = builder.Configuration.GetValue<bool?>(
     "Compaction:Enabled") ?? true;
 var compactionOptions = new ConversationCompactionOptions
@@ -95,6 +101,7 @@ builder.Services.AddSingleton<IMediatedRequestStore>(services =>
 builder.Services.AddSingleton<IConversationCompactionStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton(compactionOptions);
+builder.Services.AddSingleton(turnProcessingOptions);
 builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
         services.GetRequiredService<IConversationStore>(),

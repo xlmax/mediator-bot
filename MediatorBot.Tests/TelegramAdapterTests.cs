@@ -186,6 +186,8 @@ public sealed class TelegramAdapterTests
             fixture.Registry,
             fixture.Store,
             fixture.Store,
+            fixture.Store,
+            fixture.WorkQueue,
             fixture.Options);
 
         var responses = new[]
@@ -199,6 +201,72 @@ public sealed class TelegramAdapterTests
         Assert.All(
             responses,
             response => Assert.DoesNotContain(fixture.Session.Id.ToString(), response.Text));
+    }
+
+    [Fact]
+    public async Task RetryFailedCommand_RetriesOnlyCallingParticipantsTurns()
+    {
+        var fixture = CreateFixture();
+        var turnA = new PendingExternalTurn(
+            Guid.NewGuid(),
+            fixture.Session.Id,
+            fixture.Session.ParticipantA.Id,
+            "telegram",
+            "failed-a",
+            8,
+            ParticipantAUserId.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            "failed-a",
+            DateTimeOffset.UtcNow);
+        var turnB = new PendingExternalTurn(
+            Guid.NewGuid(),
+            fixture.Session.Id,
+            fixture.Session.ParticipantB.Id,
+            "telegram",
+            "failed-b",
+            9,
+            ParticipantBUserId.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            "failed-b",
+            DateTimeOffset.UtcNow);
+        Assert.True(await fixture.Store.TryEnqueueAsync(turnA));
+        Assert.True(await fixture.Store.TryEnqueueAsync(turnB));
+        await fixture.Store.MarkFailedAsync(
+            fixture.Session.Id,
+            turnA.Id,
+            "TestFailure",
+            DateTimeOffset.UtcNow);
+        await fixture.Store.MarkFailedAsync(
+            fixture.Session.Id,
+            turnB.Id,
+            "TestFailure",
+            DateTimeOffset.UtcNow);
+        await fixture.WorkQueue.StopAsync();
+        var commands = new TelegramCommandService(
+            fixture.Registry,
+            fixture.Store,
+            fixture.Store,
+            fixture.Store,
+            fixture.WorkQueue,
+            fixture.Options);
+
+        var statusBefore = await commands.GetStatusAsync(ParticipantAUserId);
+        var retry = await commands.RetryFailedAsync(ParticipantAUserId);
+
+        Assert.Contains("не удалось обработать ваших сообщений: 1", statusBefore.Text);
+        Assert.Contains("запущена", retry.Text);
+        Assert.Equal(
+            0,
+            await fixture.Store.GetFailedCountAsync(
+                fixture.Session.Id,
+                fixture.Session.ParticipantA.Id));
+        Assert.Equal(
+            1,
+            await fixture.Store.GetFailedCountAsync(
+                fixture.Session.Id,
+                fixture.Session.ParticipantB.Id));
+        Assert.Equal(turnA.Id, Assert.Single(
+            await fixture.Store.GetPendingAsync(fixture.Session.Id)).Id);
     }
 
     [Fact]
@@ -549,8 +617,9 @@ public sealed class TelegramAdapterTests
         var fixture = CreateFixture(runtime);
         fixture.Transport.FailForTelegramUserId = ParticipantBUserId;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            fixture.Processor.ProcessPrivateTextAsync(
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await fixture.Processor.ProcessPrivateTextAsync(
                 32,
                 ParticipantAUserId,
                 "Первый turn"));
@@ -589,8 +658,9 @@ public sealed class TelegramAdapterTests
         var fixture = CreateFixture(runtime);
         fixture.Transport.FailForTelegramUserId = ParticipantAUserId;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            fixture.Processor.ProcessPrivateTextAsync(
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await fixture.Processor.ProcessPrivateTextAsync(
                 34,
                 ParticipantAUserId,
                 "Открыть запрос"));
@@ -622,8 +692,9 @@ public sealed class TelegramAdapterTests
             TimeSpan.FromMilliseconds(50));
         fixture.Transport.HangForTelegramUserId = ParticipantAUserId;
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            fixture.Processor.ProcessPrivateTextAsync(
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await fixture.Processor.ProcessPrivateTextAsync(
                 34,
                 ParticipantAUserId,
                 "Turn с зависшей доставкой"));
@@ -671,10 +742,12 @@ public sealed class TelegramAdapterTests
         var fixture = CreateFixture(
             new SendToParticipantModelRuntime(),
             deliveryRecordingTimeout: TimeSpan.FromMilliseconds(30),
-            turnExecutionStore: new HangingTurnExecutionStore());
+            hangDeliveryRecording: true,
+            turnMaxAttempts: 1);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            fixture.Processor.ProcessPrivateTextAsync(
+        Assert.Equal(
+            TelegramMessageProcessingStatus.ProcessingFailed,
+            await fixture.Processor.ProcessPrivateTextAsync(
                 37,
                 ParticipantAUserId,
                 "Turn с зависшей записью"));
@@ -683,6 +756,43 @@ public sealed class TelegramAdapterTests
         var incoming = Assert.Single(
             await fixture.Store.GetHistoryAsync(fixture.Session.Id));
         Assert.Equal(MessageDirection.ParticipantToMediator, incoming.Direction);
+    }
+
+    [Fact]
+    public async Task RecordingFailure_RetriesDeliveryOnlyUpToTurnLimit()
+    {
+        var runtime = new SendToParticipantModelRuntime();
+        var fixture = CreateFixture(
+            runtime,
+            deliveryRecordingTimeout: TimeSpan.FromMilliseconds(30),
+            hangDeliveryRecording: true,
+            turnMaxAttempts: 3);
+
+        Assert.Equal(
+            TelegramMessageProcessingStatus.Deferred,
+            await fixture.Processor.ProcessPrivateTextAsync(
+                38,
+                ParticipantAUserId,
+                "Turn с постоянной ошибкой записи"));
+        var timeout = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (await fixture.Store.GetFailedCountAsync(
+                   fixture.Session.Id,
+                   fixture.Session.ParticipantA.Id) == 0)
+        {
+            if (DateTimeOffset.UtcNow >= timeout)
+            {
+                throw new TimeoutException("The turn was not quarantined.");
+            }
+
+            await Task.Delay(10);
+        }
+
+        Assert.Equal(1, runtime.CallCount);
+        Assert.Equal(3, fixture.Transport.Deliveries.Count(delivery =>
+            delivery == (ParticipantAUserId, "Ответ")));
+        await Task.Delay(100);
+        Assert.Equal(3, fixture.Transport.Deliveries.Count(delivery =>
+            delivery == (ParticipantAUserId, "Ответ")));
     }
 
     [Fact]
@@ -768,6 +878,8 @@ public sealed class TelegramAdapterTests
         TimeSpan? deliveryTimeout = null,
         TimeSpan? deliveryRecordingTimeout = null,
         ITurnExecutionStore? turnExecutionStore = null,
+        bool hangDeliveryRecording = false,
+        int turnMaxAttempts = 3,
         ConversationCompactionOptions? compactionOptions = null,
         IConversationSummaryGenerator? summaryGenerator = null)
     {
@@ -786,7 +898,13 @@ public sealed class TelegramAdapterTests
         };
         var registry = new TelegramParticipantRegistry(store, store, options);
         var transport = new RecordingTelegramTransport();
-        var effectiveTurnExecutionStore = turnExecutionStore ?? store;
+        ITurnExecutionStore effectiveTurnExecutionStore = turnExecutionStore ?? store;
+        if (hangDeliveryRecording)
+        {
+            effectiveTurnExecutionStore = new HangingDeliveryRecordingStore(
+                effectiveTurnExecutionStore);
+        }
+
         var dispatcher = new TelegramMediatorActionDispatcher(
             registry,
             transport,
@@ -826,6 +944,11 @@ public sealed class TelegramAdapterTests
             transport,
             options,
             effectiveCompactionOptions,
+            new TelegramTurnProcessingOptions
+            {
+                MaxAttempts = turnMaxAttempts,
+                RetryDelay = TimeSpan.FromMilliseconds(20)
+            },
             NullLogger<TelegramSessionWorkQueue>.Instance);
         var processor = new TelegramMessageProcessor(
             registry,
@@ -840,6 +963,7 @@ public sealed class TelegramAdapterTests
             registry,
             transport,
             dispatcher,
+            workQueue,
             processor);
     }
 
@@ -850,6 +974,7 @@ public sealed class TelegramAdapterTests
         TelegramParticipantRegistry Registry,
         RecordingTelegramTransport Transport,
         TelegramMediatorActionDispatcher Dispatcher,
+        TelegramSessionWorkQueue WorkQueue,
         TelegramMessageProcessor Processor);
 
     private sealed class RecordingModelRuntime : IModelRuntime
@@ -944,16 +1069,21 @@ public sealed class TelegramAdapterTests
 
     private sealed class SendToParticipantModelRuntime : IModelRuntime
     {
+        public int CallCount { get; private set; }
+
         public Task<ModelResult> ProcessAsync(
             ConversationContext context,
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult<ModelResult>(new(
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.FromResult<ModelResult>(new(
                 [
                     new SendToParticipant(
                         context.Author.Id,
                         "Ответ",
                         DisclosureDecision.PrivateResponse)
                 ]));
+        }
     }
 
     private sealed class SendToBothModelRuntime : IModelRuntime
@@ -1001,45 +1131,43 @@ public sealed class TelegramAdapterTests
         }
     }
 
-    private sealed class HangingTurnExecutionStore : ITurnExecutionStore
+    private sealed class HangingDeliveryRecordingStore(ITurnExecutionStore inner)
+        : ITurnExecutionStore
     {
         public Task<string?> GetModelResultAsync(
             Guid sessionId,
             Guid turnId,
             CancellationToken cancellationToken = default) =>
-            Task.FromResult<string?>(null);
+            inner.GetModelResultAsync(sessionId, turnId, cancellationToken);
 
         public Task SaveModelResultAsync(
             Guid sessionId,
             Guid turnId,
             string modelResultJson,
-            CancellationToken cancellationToken = default) => Task.CompletedTask;
+            CancellationToken cancellationToken = default) =>
+            inner.SaveModelResultAsync(
+                sessionId,
+                turnId,
+                modelResultJson,
+                cancellationToken);
 
         public Task<IReadOnlyList<TurnDelivery>> EnsureDeliveryPlanAsync(
             TurnDeliveryPlan plan,
             CancellationToken cancellationToken = default) =>
-            Task.FromResult<IReadOnlyList<TurnDelivery>>(
-                plan.Chunks.Select((text, index) => new TurnDelivery(
-                    Guid.NewGuid(),
-                    plan.TurnId,
-                    plan.SessionId,
-                    plan.ParticipantId,
-                    Guid.NewGuid(),
-                    plan.DeliveryKey,
-                    index + 1,
-                    plan.Chunks.Count,
-                    text,
-                    plan.ActionType,
-                    plan.DisclosureDecision,
-                    TurnDeliveryStatus.Pending,
-                    plan.CreatedAt)).ToArray());
+            inner.EnsureDeliveryPlanAsync(plan, cancellationToken);
 
         public Task MarkDeliveryAttemptingAsync(
             Guid sessionId,
             Guid turnId,
             Guid deliveryId,
             DateTimeOffset attemptedAt,
-            CancellationToken cancellationToken = default) => Task.CompletedTask;
+            CancellationToken cancellationToken = default) =>
+            inner.MarkDeliveryAttemptingAsync(
+                sessionId,
+                turnId,
+                deliveryId,
+                attemptedAt,
+                cancellationToken);
 
         public Task RecordDeliveryAsync(
             Guid sessionId,

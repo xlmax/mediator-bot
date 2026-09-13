@@ -21,6 +21,7 @@ public sealed class InMemoryConversationStore :
         (string Source, Guid SessionId, string ExternalUpdateId)> _externalUpdates = [];
     private readonly Dictionary<Guid, MediatedRequest> _mediatedRequests = [];
     private readonly Dictionary<Guid, PendingExternalTurn> _pendingTurns = [];
+    private readonly HashSet<Guid> _failedTurns = [];
     private readonly Dictionary<Guid, string> _modelResultsByTurn = [];
     private readonly Dictionary<Guid, TurnDelivery> _turnDeliveries = [];
     private readonly HashSet<Guid> _recordedIncomingTurns = [];
@@ -86,14 +87,37 @@ public sealed class InMemoryConversationStore :
             }
 
             ValidateParticipants(session, message);
-            var existing = _messagesBySession.Values
-                .SelectMany(messages => messages)
+            var allMessages = _messagesBySession.Values
+                .SelectMany(messages => messages);
+            var existing = allMessages
                 .FirstOrDefault(entry => entry.Message.Id == message.Id)
                 ?.Message;
             if (existing is not null)
             {
                 EnsureSameMessage(existing, message);
                 return Task.CompletedTask;
+            }
+
+            if (message.Direction == MessageDirection.ParticipantToMediator &&
+                _pendingTurns.TryGetValue(message.Id, out var pendingTurn) &&
+                !_recordedIncomingTurns.Contains(message.Id))
+            {
+                var messages = _messagesBySession[message.SessionId];
+                var legacyIndex = messages.FindIndex(entry =>
+                    entry.Message.Id != message.Id &&
+                    entry.Message.AuthorId == message.AuthorId &&
+                    entry.Message.RecipientId is null &&
+                    entry.Message.Direction == MessageDirection.ParticipantToMediator &&
+                    string.Equals(entry.Message.Text, message.Text, StringComparison.Ordinal) &&
+                    entry.Message.CreatedAt >= pendingTurn.CreatedAt);
+                if (legacyIndex >= 0)
+                {
+                    messages[legacyIndex] = new SequencedMessage(
+                        messages[legacyIndex].Sequence,
+                        message);
+                    _recordedIncomingTurns.Add(message.Id);
+                    return Task.CompletedTask;
+                }
             }
 
             if (_recordedIncomingTurns.Contains(message.Id))
@@ -430,11 +454,97 @@ public sealed class InMemoryConversationStore :
             EnsureSessionExists(sessionId);
             return Task.FromResult<IReadOnlyList<PendingExternalTurn>>(
                 _pendingTurns.Values
-                    .Where(turn => turn.SessionId == sessionId)
+                    .Where(turn =>
+                        turn.SessionId == sessionId &&
+                        !_failedTurns.Contains(turn.Id))
                     .OrderBy(turn => turn.SourceSequence)
                     .ThenBy(turn => turn.CreatedAt)
                     .ThenBy(turn => turn.Id)
                     .ToArray());
+        }
+    }
+
+    public Task<int> BeginAttemptAsync(
+        Guid sessionId,
+        Guid turnId,
+        DateTimeOffset attemptedAt,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            var turn = GetPendingTurn(sessionId, turnId);
+            if (_failedTurns.Contains(turnId))
+            {
+                throw new InvalidOperationException(
+                    $"Pending turn '{turnId}' is quarantined.");
+            }
+
+            turn = turn with { AttemptCount = checked(turn.AttemptCount + 1) };
+            _pendingTurns[turnId] = turn;
+            return Task.FromResult(turn.AttemptCount);
+        }
+    }
+
+    public Task MarkFailedAsync(
+        Guid sessionId,
+        Guid turnId,
+        string failureType,
+        DateTimeOffset failedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(failureType);
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            GetPendingTurn(sessionId, turnId);
+            _failedTurns.Add(turnId);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<int> GetFailedCountAsync(
+        Guid sessionId,
+        Guid participantId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            var session = _sessions.GetValueOrDefault(sessionId)
+                ?? throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
+            session.GetParticipant(participantId);
+            return Task.FromResult(_failedTurns.Count(turnId =>
+                _pendingTurns.TryGetValue(turnId, out var turn) &&
+                turn.SessionId == sessionId &&
+                turn.ParticipantId == participantId));
+        }
+    }
+
+    public Task<int> RetryFailedAsync(
+        Guid sessionId,
+        Guid participantId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            var session = _sessions.GetValueOrDefault(sessionId)
+                ?? throw new KeyNotFoundException($"Session '{sessionId}' was not found.");
+            session.GetParticipant(participantId);
+            var turnIds = _failedTurns.Where(turnId =>
+                    _pendingTurns.TryGetValue(turnId, out var turn) &&
+                    turn.SessionId == sessionId &&
+                    turn.ParticipantId == participantId)
+                .ToArray();
+            foreach (var turnId in turnIds)
+            {
+                _failedTurns.Remove(turnId);
+                _pendingTurns[turnId] = _pendingTurns[turnId] with { AttemptCount = 0 };
+            }
+
+            return Task.FromResult(turnIds.Length);
         }
     }
 
@@ -455,6 +565,7 @@ public sealed class InMemoryConversationStore :
             }
 
             _pendingTurns.Remove(turnId);
+            _failedTurns.Remove(turnId);
             _modelResultsByTurn.Remove(turnId);
             _recordedIncomingTurns.Remove(turnId);
             foreach (var deliveryId in _turnDeliveries.Values
@@ -679,9 +790,22 @@ public sealed class InMemoryConversationStore :
             var messages = _messagesBySession[sessionId]
                 .OrderBy(entry => entry.Sequence)
                 .ToArray();
+            var activePendingTurns = _pendingTurns.Values
+                .Where(turn =>
+                    turn.SessionId == sessionId &&
+                    !_failedTurns.Contains(turn.Id))
+                .ToArray();
             var firstPendingIndex = Array.FindIndex(messages, entry =>
-                _recordedIncomingTurns.Contains(entry.Message.Id) &&
-                _pendingTurns.ContainsKey(entry.Message.Id));
+                activePendingTurns.Any(turn =>
+                    entry.Message.Id == turn.Id ||
+                    (entry.Message.AuthorId == turn.ParticipantId &&
+                     entry.Message.RecipientId is null &&
+                     entry.Message.Direction == MessageDirection.ParticipantToMediator &&
+                     string.Equals(
+                         entry.Message.Text,
+                         turn.Text,
+                         StringComparison.Ordinal) &&
+                     entry.Message.CreatedAt >= turn.CreatedAt)));
             if (firstPendingIndex >= 0)
             {
                 messages = messages.Take(firstPendingIndex).ToArray();
@@ -872,17 +996,16 @@ public sealed class InMemoryConversationStore :
         IReadOnlyList<TurnDelivery> existing,
         TurnDeliveryPlan plan)
     {
-        if (existing.Count != plan.Chunks.Count ||
-            existing.Any(delivery =>
+        if (existing.Any(delivery =>
                 delivery.SessionId != plan.SessionId ||
                 delivery.ParticipantId != plan.ParticipantId ||
-                delivery.ChunkCount != plan.Chunks.Count ||
+                delivery.ChunkCount != existing.Count ||
                 delivery.ActionType != plan.ActionType ||
-                delivery.DisclosureDecision != plan.DisclosureDecision ||
-                !string.Equals(
-                    delivery.Text,
-                    plan.Chunks[delivery.ChunkIndex - 1],
-                    StringComparison.Ordinal)))
+                delivery.DisclosureDecision != plan.DisclosureDecision) ||
+            !string.Equals(
+                string.Concat(existing.Select(delivery => delivery.Text)),
+                string.Concat(plan.Chunks),
+                StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 $"Delivery plan '{plan.DeliveryKey}' conflicts with persisted deliveries.");

@@ -12,6 +12,7 @@ public sealed class TelegramSessionWorkQueue(
     ITelegramMessageTransport transport,
     TelegramAdapterOptions telegramOptions,
     ConversationCompactionOptions compactionOptions,
+    TelegramTurnProcessingOptions turnProcessingOptions,
     ILogger<TelegramSessionWorkQueue> logger)
 {
     private const string CompactionStartedMessage =
@@ -22,6 +23,10 @@ public sealed class TelegramSessionWorkQueue(
     private const string CompactionFailedMessage =
         "Не удалось полностью обновить краткую память, но ваше сообщение сохранено. " +
         "Продолжаю без удаления прежней истории.";
+    private const string TurnFailedMessage =
+        "Не удалось обработать сохранённое сообщение. " +
+        "Следующие сообщения продолжат обрабатываться. " +
+        "Повторить попытку можно командой /retry_failed.";
 
     private readonly Lock _lock = new();
     private readonly Dictionary<Guid, SessionQueueState> _states = [];
@@ -44,8 +49,7 @@ public sealed class TelegramSessionWorkQueue(
         {
             if (_stopping)
             {
-                throw new OperationCanceledException(
-                    "Telegram turn processing is stopping. The durable turn remains pending.");
+                return TelegramMessageProcessingStatus.Deferred;
             }
 
             state = GetOrCreateState(turn.SessionId);
@@ -69,7 +73,21 @@ public sealed class TelegramSessionWorkQueue(
             StartRunner(turn.SessionId, state, runnerCompletion);
         }
 
-        return await completion.Task.WaitAsync(cancellationToken);
+        try
+        {
+            return await completion.Task.WaitAsync(cancellationToken);
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                if (state.Waiters.TryGetValue(turn.Id, out var current) &&
+                    ReferenceEquals(current, completion))
+                {
+                    state.Waiters.Remove(turn.Id);
+                }
+            }
+        }
     }
 
     public Task RecoverSessionAsync(
@@ -105,6 +123,7 @@ public sealed class TelegramSessionWorkQueue(
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
         Task[] runners;
+        TaskCompletionSource<TelegramMessageProcessingStatus>[] waiters;
         lock (_lock)
         {
             _stopping = true;
@@ -112,6 +131,25 @@ public sealed class TelegramSessionWorkQueue(
             runners = _activeRunners
                 .Select(completion => completion.Task)
                 .ToArray();
+            waiters = _states.Values
+                .SelectMany(state => state.Waiters
+                    .Where(waiter => waiter.Key != state.ActiveTurnId)
+                    .Select(waiter => waiter.Value))
+                .ToArray();
+            foreach (var state in _states.Values)
+            {
+                foreach (var turnId in state.Waiters.Keys
+                             .Where(turnId => turnId != state.ActiveTurnId)
+                             .ToArray())
+                {
+                    state.Waiters.Remove(turnId);
+                }
+            }
+        }
+
+        foreach (var waiter in waiters)
+        {
+            waiter.TrySetResult(TelegramMessageProcessingStatus.Deferred);
         }
 
         await Task.WhenAll(runners).WaitAsync(cancellationToken);
@@ -191,6 +229,7 @@ public sealed class TelegramSessionWorkQueue(
                     "Pending turn query failed. SessionId={SessionId} ErrorType={ErrorType}",
                     sessionId,
                     exception.GetType().Name);
+                DeferWaiters(state);
                 StopRunner(state);
                 ScheduleRecovery(sessionId);
                 return;
@@ -211,6 +250,47 @@ public sealed class TelegramSessionWorkQueue(
                 return;
             }
 
+            SetActiveTurn(state, turn.Id);
+            int attemptCount;
+            try
+            {
+                attemptCount = await turnQueueStore.BeginAttemptAsync(
+                    sessionId,
+                    turn.Id,
+                    DateTimeOffset.UtcNow);
+            }
+            catch (Exception exception)
+            {
+                logger.LogError(
+                    "Pending turn attempt checkpoint failed. " +
+                    "SessionId={SessionId} UpdateId={UpdateId} ErrorType={ErrorType}",
+                    sessionId,
+                    turn.SourceSequence,
+                    exception.GetType().Name);
+                ClearActiveTurn(state, turn.Id);
+                DeferWaiters(state);
+                StopRunner(state);
+                ScheduleRecovery(sessionId);
+                return;
+            }
+
+            if (attemptCount > turnProcessingOptions.MaxAttempts)
+            {
+                if (await TryQuarantineTurnAsync(
+                        state,
+                        turn,
+                        "RetryLimitExceeded"))
+                {
+                    ClearActiveTurn(state, turn.Id);
+                    continue;
+                }
+
+                ClearActiveTurn(state, turn.Id);
+                StopRunner(state);
+                ScheduleRecovery(sessionId);
+                return;
+            }
+
             try
             {
                 var result = await turnCoordinator.ExecuteAsync(
@@ -219,6 +299,7 @@ public sealed class TelegramSessionWorkQueue(
                     CancellationToken.None);
                 await turnQueueStore.CompleteAsync(sessionId, turn.Id);
                 CompleteWaiter(state, turn.Id, result);
+                ClearActiveTurn(state, turn.Id);
                 if (IsStopping())
                 {
                     StopRunner(state);
@@ -228,12 +309,27 @@ public sealed class TelegramSessionWorkQueue(
             catch (Exception exception)
             {
                 logger.LogError(
-                    "Queued Telegram turn remains pending after processing failure. " +
-                    "SessionId={SessionId} UpdateId={UpdateId} ErrorType={ErrorType}",
+                    "Queued Telegram turn processing failed. " +
+                    "SessionId={SessionId} UpdateId={UpdateId} " +
+                    "AttemptCount={AttemptCount} ErrorType={ErrorType}",
                     sessionId,
                     turn.SourceSequence,
+                    attemptCount,
                     exception.GetType().Name);
-                FailWaiter(state, turn.Id, exception);
+                if (attemptCount >= turnProcessingOptions.MaxAttempts)
+                {
+                    if (await TryQuarantineTurnAsync(
+                            state,
+                            turn,
+                            exception.GetType().Name))
+                    {
+                        ClearActiveTurn(state, turn.Id);
+                        continue;
+                    }
+                }
+
+                ClearActiveTurn(state, turn.Id);
+                DeferWaiters(state);
                 StopRunner(state);
                 ScheduleRecovery(sessionId);
                 return;
@@ -400,7 +496,26 @@ public sealed class TelegramSessionWorkQueue(
         return state;
     }
 
-    private void CompleteWaiter(
+    private void SetActiveTurn(SessionQueueState state, Guid turnId)
+    {
+        lock (_lock)
+        {
+            state.ActiveTurnId = turnId;
+        }
+    }
+
+    private void ClearActiveTurn(SessionQueueState state, Guid turnId)
+    {
+        lock (_lock)
+        {
+            if (state.ActiveTurnId == turnId)
+            {
+                state.ActiveTurnId = null;
+            }
+        }
+    }
+
+    private bool CompleteWaiter(
         SessionQueueState state,
         Guid turnId,
         TelegramMessageProcessingStatus result)
@@ -414,24 +529,70 @@ public sealed class TelegramSessionWorkQueue(
             }
         }
 
-        waiter?.TrySetResult(result);
+        return waiter?.TrySetResult(result) == true;
     }
 
-    private void FailWaiter(
-        SessionQueueState state,
-        Guid turnId,
-        Exception exception)
+    private void DeferWaiters(SessionQueueState state)
     {
-        TaskCompletionSource<TelegramMessageProcessingStatus>? waiter = null;
+        TaskCompletionSource<TelegramMessageProcessingStatus>[] waiters;
         lock (_lock)
         {
-            if (state.Waiters.Remove(turnId, out var found))
-            {
-                waiter = found;
-            }
+            waiters = state.Waiters.Values.ToArray();
+            state.Waiters.Clear();
         }
 
-        waiter?.TrySetException(exception);
+        foreach (var waiter in waiters)
+        {
+            waiter.TrySetResult(TelegramMessageProcessingStatus.Deferred);
+        }
+    }
+
+    private async Task<bool> TryQuarantineTurnAsync(
+        SessionQueueState state,
+        PendingExternalTurn turn,
+        string failureType)
+    {
+        try
+        {
+            await turnQueueStore.MarkFailedAsync(
+                turn.SessionId,
+                turn.Id,
+                failureType,
+                DateTimeOffset.UtcNow);
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(
+                "Failed turn quarantine checkpoint failed. " +
+                "SessionId={SessionId} UpdateId={UpdateId} ErrorType={ErrorType}",
+                turn.SessionId,
+                turn.SourceSequence,
+                exception.GetType().Name);
+            return false;
+        }
+
+        logger.LogError(
+            "Queued Telegram turn was quarantined after exhausting retries. " +
+            "SessionId={SessionId} UpdateId={UpdateId} AttemptCount={AttemptCount} " +
+            "FailureType={FailureType}",
+            turn.SessionId,
+            turn.SourceSequence,
+            turnProcessingOptions.MaxAttempts,
+            failureType);
+        var waiterCompleted = CompleteWaiter(
+            state,
+            turn.Id,
+            TelegramMessageProcessingStatus.ProcessingFailed);
+        DeferWaiters(state);
+        if (!waiterCompleted)
+        {
+            var telegramUserId = long.Parse(
+                turn.ExternalUserId,
+                CultureInfo.InvariantCulture);
+            await SafeSendAsync(telegramUserId, TurnFailedMessage);
+        }
+
+        return true;
     }
 
     private void ScheduleRecovery(Guid sessionId)
@@ -452,7 +613,7 @@ public sealed class TelegramSessionWorkQueue(
         try
         {
             await Task.Delay(
-                compactionOptions.RetryDelay,
+                turnProcessingOptions.RetryDelay,
                 _lifetimeCancellation.Token);
             await RecoverSessionAsync(sessionId, _lifetimeCancellation.Token);
         }
@@ -490,6 +651,8 @@ public sealed class TelegramSessionWorkQueue(
         public Dictionary<long, Task> StartNotificationTasks { get; } = [];
 
         public bool IsRunning { get; set; }
+
+        public Guid? ActiveTurnId { get; set; }
 
         public TaskCompletionSource? RunnerCompletion { get; set; }
 
