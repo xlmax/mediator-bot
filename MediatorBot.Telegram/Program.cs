@@ -81,6 +81,38 @@ var compactionOptions = new ConversationCompactionOptions
     RetryDelay = TimeSpan.FromSeconds(
         GetPositiveInt("Compaction:RetryDelaySeconds", 60))
 };
+var initiativeOptions = new InitiativeOptions
+{
+    Enabled = builder.Configuration.GetValue<bool?>("Initiative:Enabled") ?? false,
+    ShadowMode = builder.Configuration.GetValue<bool?>("Initiative:ShadowMode") ?? false,
+    HeartbeatInterval = TimeSpan.FromMinutes(
+        GetPositiveInt("Initiative:HeartbeatMinutes", 30)),
+    MinimumQuietPeriod = TimeSpan.FromMinutes(
+        GetPositiveInt("Initiative:MinimumQuietMinutes", 30)),
+    MaxHistoryMessages = GetPositiveInt("Initiative:MaxHistoryMessages", 80),
+    RecentDecisionCount = GetPositiveInt("Initiative:RecentDecisionCount", 20),
+    MinimumReevaluationMinutes = GetPositiveInt(
+        "Initiative:MinimumReevaluationMinutes",
+        30),
+    MaximumReevaluationMinutes = GetPositiveInt(
+        "Initiative:MaximumReevaluationMinutes",
+        10_080),
+    MaxContactsPerParticipantPer24Hours = GetPositiveInt(
+        "Initiative:MaxContactsPerParticipantPer24Hours",
+        2),
+    MaxDeliveryAttempts = GetPositiveInt("Initiative:MaxDeliveryAttempts", 3),
+    QuietHoursStartHour = GetHour("Initiative:QuietHoursStartHour", 22),
+    QuietHoursEndHour = GetHour("Initiative:QuietHoursEndHour", 9),
+    TimeZoneId = builder.Configuration["Initiative:TimeZoneId"] ?? "Europe/Moscow"
+};
+if (initiativeOptions.MinimumReevaluationMinutes >
+    initiativeOptions.MaximumReevaluationMinutes)
+{
+    throw new InvalidOperationException(
+        "Initiative minimum reevaluation interval cannot exceed the maximum.");
+}
+
+_ = TimeZoneInfo.FindSystemTimeZoneById(initiativeOptions.TimeZoneId);
 
 builder.Services.AddSingleton(new SqliteConversationStoreOptions(
     Path.GetFullPath(databasePath, Directory.GetCurrentDirectory()),
@@ -100,8 +132,14 @@ builder.Services.AddSingleton<IMediatedRequestStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IConversationCompactionStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IInitiativeStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IInitiativeDeliveryStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton(compactionOptions);
+builder.Services.AddSingleton(initiativeOptions);
 builder.Services.AddSingleton(turnProcessingOptions);
+builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
         services.GetRequiredService<IConversationStore>(),
@@ -115,6 +153,7 @@ builder.Services.AddSingleton<MediationService>();
 if (modelRuntimeName.Equals("Fake", StringComparison.OrdinalIgnoreCase))
 {
     builder.Services.AddSingleton<IModelRuntime, FakeModelRuntime>();
+    builder.Services.AddSingleton<IInitiativeRuntime, DisabledInitiativeRuntime>();
     builder.Services.AddSingleton<
         IConversationSummaryGenerator,
         DisabledConversationSummaryGenerator>();
@@ -164,6 +203,8 @@ else if (modelRuntimeName.Equals("OpenAI", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<OpenAiConversationPromptBuilder>();
     builder.Services.AddSingleton<OpenAiToolCallMapper>();
     builder.Services.AddSingleton<IModelRuntime, OpenAiModelRuntime>();
+    builder.Services.AddSingleton<OpenAiInitiativePromptBuilder>();
+    builder.Services.AddSingleton<IInitiativeRuntime, OpenAiInitiativeRuntime>();
     builder.Services.AddSingleton<
         IConversationSummaryGenerator,
         OpenAiConversationSummaryGenerator>();
@@ -190,8 +231,12 @@ builder.Services.AddSingleton(new TelegramAdapterOptions
 builder.Services.AddSingleton<TelegramParticipantRegistry>();
 builder.Services.AddSingleton<AllowedParticipantFilter>();
 builder.Services.AddSingleton<TelegramCommandService>();
+builder.Services.AddSingleton<TelegramInitiativeCommandService>();
 builder.Services.AddSingleton<TelegramTextChunker>();
 builder.Services.AddSingleton<TelegramMediatorActionDispatcher>();
+builder.Services.AddSingleton<TelegramInitiativeDispatcher>();
+builder.Services.AddSingleton<IInitiativeContextBuilder, InitiativeContextBuilder>();
+builder.Services.AddSingleton<InitiativeEvaluationService>();
 builder.Services.AddSingleton<IConversationCompactionService, ConversationCompactionService>();
 builder.Services.AddSingleton<ITelegramQueuedTurnProcessor, TelegramQueuedTurnProcessor>();
 builder.Services.AddSingleton<TelegramSessionWorkQueue>();
@@ -206,6 +251,7 @@ builder.Services.AddLongPolling();
 // Registered before TeleFlow so the encrypted database and Session are ready
 // before long polling starts receiving updates.
 builder.Services.AddHostedService<TelegramSessionInitializer>();
+builder.Services.AddHostedService<InitiativeHeartbeatHostedService>();
 builder.Services.AddTeleFlowHostedService();
 
 await builder.Build().RunAsync();
@@ -225,5 +271,16 @@ int GetPositiveInt(string key, int defaultValue)
 {
     var value = builder.Configuration.GetValue<int?>(key) ?? defaultValue;
     ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, key);
+    return value;
+}
+
+int GetHour(string key, int defaultValue)
+{
+    var value = builder.Configuration.GetValue<int?>(key) ?? defaultValue;
+    if (value is < 0 or > 23)
+    {
+        throw new ArgumentOutOfRangeException(key, value, "Hour must be between 0 and 23.");
+    }
+
     return value;
 }

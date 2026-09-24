@@ -55,8 +55,19 @@ var options = new OpenAiModelRuntimeOptions
 var transcriptDirectory = builder.Configuration["Behavior:TranscriptDirectory"]
     ?? "artifacts/behavioral";
 var scenarioNumber = builder.Configuration.GetValue<int?>("Behavior:ScenarioNumber");
+var behaviorMode = builder.Configuration["Behavior:Mode"] ?? "Disclosure";
+var initiativeOptions = new InitiativeOptions
+{
+    MinimumReevaluationMinutes = GetPositiveInt(
+        "Initiative:MinimumReevaluationMinutes",
+        30),
+    MaximumReevaluationMinutes = GetPositiveInt(
+        "Initiative:MaximumReevaluationMinutes",
+        10_080)
+};
 
 builder.Services.AddSingleton(options);
+builder.Services.AddSingleton(initiativeOptions);
 builder.Services.AddSingleton<OpenAiSdkChatClient>();
 builder.Services.AddSingleton<IOpenAiChatClient>(services =>
     new RetryingOpenAiChatClient(
@@ -66,7 +77,10 @@ builder.Services.AddSingleton<IOpenAiChatClient>(services =>
 builder.Services.AddSingleton<OpenAiConversationPromptBuilder>();
 builder.Services.AddSingleton<OpenAiToolCallMapper>();
 builder.Services.AddSingleton<IModelRuntime, OpenAiModelRuntime>();
+builder.Services.AddSingleton<OpenAiInitiativePromptBuilder>();
+builder.Services.AddSingleton<IInitiativeRuntime, OpenAiInitiativeRuntime>();
 builder.Services.AddSingleton<BehaviorScenarioRunner>();
+builder.Services.AddSingleton<InitiativeScenarioRunner>();
 
 using var host = builder.Build();
 using var cancellation = new CancellationTokenSource();
@@ -76,12 +90,31 @@ System.Console.CancelKeyPress += (_, eventArgs) =>
     cancellation.Cancel();
 };
 
-var runner = host.Services.GetRequiredService<BehaviorScenarioRunner>();
-var transcriptPath = await runner.RunAsync(
-    model,
-    transcriptDirectory,
-    scenarioNumber,
-    cancellation.Token);
+string transcriptPath;
+if (behaviorMode.Equals("Initiative", StringComparison.OrdinalIgnoreCase))
+{
+    var runner = host.Services.GetRequiredService<InitiativeScenarioRunner>();
+    transcriptPath = await runner.RunAsync(
+        model,
+        transcriptDirectory,
+        scenarioNumber,
+        cancellation.Token);
+}
+else if (behaviorMode.Equals("Disclosure", StringComparison.OrdinalIgnoreCase))
+{
+    var runner = host.Services.GetRequiredService<BehaviorScenarioRunner>();
+    transcriptPath = await runner.RunAsync(
+        model,
+        transcriptDirectory,
+        scenarioNumber,
+        cancellation.Token);
+}
+else
+{
+    throw new InvalidOperationException(
+        $"Unknown Behavior:Mode '{behaviorMode}'. Use Disclosure or Initiative.");
+}
+
 System.Console.WriteLine($"Behaviour transcript: {transcriptPath}");
 
 string RequireConfiguration(string key)

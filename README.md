@@ -25,6 +25,9 @@ MediatorBot — экспериментальный приватный посре
 - lossless-разбиение длинных ответов на Telegram-сообщения до 4000 символов;
 - запись подтверждённых частей под единым logical message и пропуск уже доставленных частей при восстановлении;
 - graceful shutdown с прекращением приёма новой работы и ограниченным временем ожидания текущего turn;
+- опциональный live heartbeat, который переоценивает уместность инициативы без фиктивного пользовательского сообщения;
+- отдельные durable initiative decisions и outbox с повторной проверкой свежести перед отправкой;
+- тихие часы 22:00–09:00 МСК, opt-out и жёсткий лимит инициативных контактов;
 - технические логи без текстов переписки, токенов и tool arguments.
 
 ## Структура решения
@@ -35,7 +38,7 @@ MediatorBot — экспериментальный приватный посре
 | `MediatorBot.Infrastructure` | SQLCipher/SQLite persistence, Fake runtime и OpenAI-compatible runtime. |
 | `MediatorBot.Telegram` | Telegram UI и composition root на базе TeleFlow. |
 | `MediatorBot.Console` | Консольный стенд для локальной проверки mediation flow. |
-| `MediatorBot.BehaviorScenarios` | Live-harness фиксированных disclosure-сценариев с Markdown-transcript. |
+| `MediatorBot.BehaviorScenarios` | Live-harness фиксированных disclosure- и proactive initiative-сценариев с Markdown-transcript. |
 | `MediatorBot.Tests` | Unit- и integration-тесты Core, persistence, OpenAI protocol и Telegram adapter. |
 
 ## Как обрабатывается сообщение
@@ -209,6 +212,18 @@ Fake runtime отправляет тестовый ответ автору со�
 | `Compaction:MaxOutputTokens` | Лимит ответа модели при создании сжатой памяти. |
 | `Compaction:OperationTimeoutSeconds` | Общий timeout одной compaction. |
 | `Compaction:RetryDelaySeconds` | Задержка до новой попытки после ошибки compaction. |
+| `Initiative:Enabled` | Включает heartbeat проактивной оценки; по умолчанию `false`. |
+| `Initiative:ShadowMode` | Сохраняет решения, но не отправляет их. Live-режим используется при `false`. |
+| `Initiative:HeartbeatMinutes` | Частота дешёвой технической проверки; модель вызывается только при наступившей оценке. |
+| `Initiative:MinimumQuietMinutes` | Минимальная пауза после последнего сообщения участника. |
+| `Initiative:MaxHistoryMessages` | Максимум свежих сообщений в initiative-контексте. |
+| `Initiative:RecentDecisionCount` | Максимум предыдущих initiative decisions в контексте. |
+| `Initiative:MinimumReevaluationMinutes` | Нижняя граница назначаемой моделью повторной оценки. |
+| `Initiative:MaximumReevaluationMinutes` | Верхняя граница повторной оценки; по умолчанию семь дней. |
+| `Initiative:MaxContactsPerParticipantPer24Hours` | Жёсткий лимит доставленных инициатив одному участнику; по умолчанию `2`. |
+| `Initiative:MaxDeliveryAttempts` | Максимум попыток initiative delivery. |
+| `Initiative:TimeZoneId` | Часовой пояс quiet hours; по умолчанию `Europe/Moscow`. |
+| `Initiative:QuietHoursStartHour` / `EndHour` | Тихий интервал; по умолчанию `22:00–09:00`. |
 | `OpenAI:ApiKey` | API-ключ выбранного провайдера. |
 | `OpenAI:Endpoint` | Базовый URL OpenAI-compatible API. |
 | `OpenAI:Model` | Идентификатор модели у выбранного провайдера. |
@@ -265,6 +280,16 @@ Compaction выполняется между turns. Если во время н�
 
 Абсолютная exactly-once доставка через Telegram Bot API недостижима: если процесс завершится после принятия сообщения Telegram, но до локальной фиксации подтверждения, часть останется в состоянии `Attempting` и может быть отправлена повторно с риском дубля. Автоматические повторы теперь ограничены общим лимитом попыток turn; ручной `/retry_failed` начинает новый ограниченный цикл. При штатной остановке host прекращает запуск новых turns, возвращает ещё не запущенным handler’ам контролируемый статус `Deferred` и в пределах shutdown timeout ожидает текущую операцию; незавершённые строки остаются для следующего запуска. Для нескольких экземпляров по-прежнему потребуются распределённый lock или lease.
 
+## Проактивный режим
+
+Heartbeat относится к той же session и общей памяти пары, но использует отдельный контекст без текущего автора и фиктивного входящего сообщения. Каждое осмысленное пробуждение создаёт `InitiativeDecision`: фазу, уверенность, действие, адресата, краткую operational rationale, предполагаемый текст и `NextEvaluationAt`. Решения и доставки хранятся отдельно от пользовательских turns.
+
+Технический heartbeat каждые 30 минут не обязательно вызывает модель. Оценка выполняется после новой participant activity либо при наступившем `NextEvaluationAt`; даже спокойное состояние получает дальнюю повторную оценку. Во время пользовательского turn, quiet hours или минимальной паузы модель не вызывается. LLM-запрос выполняется без удержания session lock, а перед сохранением и перед доставкой система повторно проверяет отсутствие новых сообщений и pending turns.
+
+Будущий план никогда не является запланированной отправкой: в назначенное время ситуация оценивается заново. Live-доставка использует отдельный durable outbox и записывает сообщение в общую историю только после подтверждения Telegram. Частично доставленный `ContactBoth` восстанавливается по получателям и чанкам. Остаточный риск дубля после Telegram delivery и до локального checkpoint такой же, как у обычных turns.
+
+Участник управляет инициативами командами `/proactive_status`, `/proactive_off` и `/proactive_on`. Обычные ответы на его сообщения продолжают работать при отключённой инициативе. По умолчанию весь режим выключен конфигурацией; включение production требует `Initiative__Enabled=true`.
+
 ## Консольный стенд
 
 `MediatorBot.Console` создаёт новую session или продолжает существующую и по очереди принимает сообщения от Participant A и Participant B.
@@ -294,6 +319,16 @@ dotnet run --project MediatorBot.Console -- --session <SessionId>
 
 Команда `exit` завершает работу.
 
+Локальный HTML-аудит initiative decisions из зашифрованной БД создаётся явной командой:
+
+```bash
+dotnet run --project MediatorBot.Console -- \
+  --session <SessionId> \
+  --initiative-report ./private/initiative-report.html
+```
+
+Отчёт содержит внутренние rationale и предложенные тексты, поэтому его нельзя сохранять в публичные `artifacts`, логи или репозиторий. На Linux файл получает mode `600`.
+
 ## Персистентные посреднические запросы
 
 Если участник просит что-либо уточнить у партнёра, модель может открыть `open_mediated_request`. Запрос сохраняется в SQLCipher отдельно от ограниченного окна истории и проходит состояния:
@@ -308,7 +343,7 @@ PendingDelivery → AwaitingResponse → Answered / Declined / NoShareableAnswer
 
 ## Behavioural disclosure scenarios
 
-`MediatorBot.BehaviorScenarios` прогоняет восемь изолированных синтетических сценариев: прямой и косвенный запросы на утечку, эмоциональное состояние, враждебную и конструктивную передачу, использование общего знания, safety-конфликт версий и закрытие посреднического запроса после отказа.
+`MediatorBot.BehaviorScenarios` прогоняет изолированные синтетические disclosure-сценарии, включая privacy, mediation-first bridges, safety и anti-rumination. Отдельный initiative-режим проверяет активный конфликт, cooling down, просьбу дать пространство, проигнорированный check-in, позитивную реакцию и взаимную готовность к примирению.
 
 Пример запуска через environment variables в PowerShell:
 
@@ -323,6 +358,12 @@ Harness не использует рабочую базу и Telegram. Для к
 
 ```bash
 dotnet run --project MediatorBot.BehaviorScenarios -- --Behavior:ScenarioNumber 8
+```
+
+Проактивные сценарии запускаются отдельно и никогда не используют Telegram transport:
+
+```bash
+dotnet run --project MediatorBot.BehaviorScenarios -- --Behavior:Mode Initiative
 ```
 
 ## Docker Compose
@@ -379,6 +420,9 @@ dotnet test MediatorBot.slnx
 - Telegram update и его payload атомарно сохраняются в `PendingTurns` до начала обработки; само входящее сообщение сохраняется в истории до обращения к модели.
 - Исходящий ответ сохраняется только после подтверждённой доставки.
 - После подтверждённой доставки фиксация выполняется независимо от отмены исходного Telegram update и ограничивается собственным timeout.
+- Предложенные, но не отправленные initiative messages не попадают в общую conversation history.
+- Initiative delivery повторно проверяет opt-out, временную паузу, quiet hours, лимит и свежесть контекста.
+- Operational rationale и proposed messages хранятся только в SQLCipher и не выводятся в application logs.
 
 Защита базы зависит от стойкости `Storage:DatabaseKey` и безопасности среды, в которой запущен процесс.
 
@@ -423,6 +467,8 @@ ProtocolReason=OutputTokenLimit
 - Блокировка turn хранится в памяти процесса и не подходит для нескольких одновременно запущенных экземпляров приложения.
 - Fallback между моделями и distributed lock не реализованы.
 - Открытые посреднические запросы не завершаются автоматически, если адресат вообще не отвечает.
+- Реакция на инициативу определяется из последующей истории вероятностно; отсутствие ответа не считается доказательством состояния отношений.
+- Proactive heartbeat, как и Telegram host, пока рассчитан на один процесс без distributed lease.
 - Успех зависит от того, насколько выбранная модель соблюдает обязательный tool protocol.
 - Используется alpha-версия TeleFlow, закреплённая в файле проекта.
 - Проект пока предназначен для контролируемого тестирования, а не для production-развёртывания.

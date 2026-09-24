@@ -590,6 +590,164 @@ public sealed class SqliteConversationStoreTests
     }
 
     [Fact]
+    public async Task InitiativeDecisionAndDelivery_SurviveRestartAndRecordHistory()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, _) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        var incoming = Incoming(
+            session,
+            participantA,
+            "Контекст инициативы",
+            DateTimeOffset.UtcNow.AddHours(-2));
+        await store.SaveMessageAsync(incoming);
+        var decision = new InitiativeDecision(
+            Guid.NewGuid(),
+            session.Id,
+            incoming.Id,
+            DateTimeOffset.UtcNow,
+            RelationshipPhase.CoolingDown,
+            InitiativeConfidence.Medium,
+            InitiativeDecisionKind.ContactParticipant,
+            participantA.Id,
+            InitiativeIntent.CheckIn,
+            InitiativeReasonCode.RecentConflict,
+            "Уместна короткая проверка состояния.",
+            "abcdef",
+            null,
+            DateTimeOffset.UtcNow.AddHours(2),
+            InitiativeDecisionStatus.PendingDelivery);
+        Assert.True(await store.TrySaveDecisionAsync(decision, null));
+        var plan = new InitiativeDeliveryPlan(
+            decision.Id,
+            session.Id,
+            participantA.Id,
+            "participant-a",
+            ["ab", "cd", "ef"],
+            decision.EvaluatedAt);
+        var deliveries = await store.EnsureInitiativeDeliveryPlanAsync(plan);
+        await store.MarkInitiativeDeliveryAttemptingAsync(
+            session.Id,
+            decision.Id,
+            deliveries[0].Id,
+            DateTimeOffset.UtcNow);
+        await store.RecordInitiativeDeliveryAsync(
+            session.Id,
+            decision.Id,
+            deliveries[0].Id,
+            DateTimeOffset.UtcNow);
+
+        var restarted = database.CreateStore();
+        var restoredDecision = Assert.Single(
+            await restarted.GetPendingDeliveryDecisionsAsync(session.Id));
+        var restoredDeliveries = await restarted.EnsureInitiativeDeliveryPlanAsync(plan);
+        Assert.Equal(decision.Id, restoredDecision.Id);
+        Assert.Equal(InitiativeDeliveryStatus.Delivered, restoredDeliveries[0].Status);
+        foreach (var delivery in restoredDeliveries.Skip(1))
+        {
+            await restarted.MarkInitiativeDeliveryAttemptingAsync(
+                session.Id,
+                decision.Id,
+                delivery.Id,
+                DateTimeOffset.UtcNow);
+            await restarted.RecordInitiativeDeliveryAsync(
+                session.Id,
+                decision.Id,
+                delivery.Id,
+                DateTimeOffset.UtcNow);
+        }
+
+        await restarted.MarkDecisionStatusAsync(
+            session.Id,
+            decision.Id,
+            InitiativeDecisionStatus.Delivered,
+            DateTimeOffset.UtcNow);
+        var outgoing = (await restarted.GetHistoryAsync(session.Id))
+            .Single(message => message.Direction == MessageDirection.MediatorToParticipant);
+        Assert.Equal("abcdef", outgoing.Text);
+        Assert.Equal(1, await restarted.CountDeliveredContactsAsync(
+            session.Id,
+            participantA.Id,
+            DateTimeOffset.UtcNow.AddDays(-1)));
+    }
+
+    [Fact]
+    public async Task InitiativePreferences_PersistOptOutAndTemporaryPause()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, participantA, participantB) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        var now = DateTimeOffset.UtcNow;
+        var incoming = Incoming(
+            session,
+            participantB,
+            "Дайте мне пространство",
+            now.AddMinutes(-30));
+        await store.SaveMessageAsync(incoming);
+        var pauseDecision = new InitiativeDecision(
+            Guid.NewGuid(),
+            session.Id,
+            incoming.Id,
+            now,
+            RelationshipPhase.CoolingDown,
+            InitiativeConfidence.High,
+            InitiativeDecisionKind.ReevaluateLater,
+            null,
+            InitiativeIntent.Observe,
+            InitiativeReasonCode.RequestedSpace,
+            "Участник явно попросил временно не инициировать контакт.",
+            null,
+            null,
+            now.AddHours(2),
+            InitiativeDecisionStatus.NoDelivery,
+            PauseParticipantId: participantB.Id,
+            PauseUntil: now.AddHours(4));
+        Assert.True(await store.TrySaveDecisionAsync(pauseDecision, null));
+
+        await store.SetParticipantEnabledAsync(
+            session.Id,
+            participantA.Id,
+            false,
+            now);
+        var restarted = database.CreateStore();
+        var preferences = await restarted.GetParticipantPreferencesAsync(session);
+        var restoredDecision = await restarted.GetLatestDecisionAsync(session.Id);
+        Assert.False(preferences.Single(item =>
+            item.ParticipantId == participantA.Id).IsEnabled);
+        Assert.Equal(
+            now.AddHours(4),
+            preferences.Single(item => item.ParticipantId == participantB.Id).PauseUntil);
+        Assert.Equal(participantB.Id, restoredDecision?.PauseParticipantId);
+        Assert.Equal(now.AddHours(4), restoredDecision?.PauseUntil);
+    }
+
+    [Fact]
+    public async Task VersionEightDatabase_IsMigratedWithInitiativeStorage()
+    {
+        using var database = new TemporaryDatabase();
+        var (session, _, _) = CreateSession();
+        var store = database.CreateStore();
+        await store.CreateSessionAsync(session);
+        await ExecuteDirectAsync(
+            database.Path,
+            """
+            DROP TABLE InitiativeDeliveries;
+            DROP TABLE InitiativeDecisions;
+            DROP TABLE InitiativeParticipantPreferences;
+            PRAGMA user_version = 8;
+            """);
+
+        var migrated = database.CreateStore();
+        await migrated.InitializeAsync();
+
+        var preferences = await migrated.GetParticipantPreferencesAsync(session);
+        Assert.Equal(2, preferences.Count);
+        Assert.All(preferences, preference => Assert.True(preference.IsEnabled));
+    }
+
+    [Fact]
     public async Task DatabaseWithNewerSchemaVersion_IsRejected()
     {
         using var database = new TemporaryDatabase();

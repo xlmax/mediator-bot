@@ -2,14 +2,16 @@ using MediatorBot.Core;
 
 namespace MediatorBot.Infrastructure;
 
-public sealed class InMemoryConversationStore :
+public sealed partial class InMemoryConversationStore :
     IConversationStore,
     IParticipantIdentityStore,
     IExternalUpdateStore,
     IExternalTurnQueueStore,
     ITurnExecutionStore,
     IMediatedRequestStore,
-    IConversationCompactionStore
+    IConversationCompactionStore,
+    IInitiativeStore,
+    IInitiativeDeliveryStore
 {
     private readonly Lock _lock = new();
     private readonly Dictionary<Guid, Session> _sessions = [];

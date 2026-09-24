@@ -1,4 +1,5 @@
 using System.Reflection;
+using MediatorBot.ConsoleApp;
 using MediatorBot.Core;
 using MediatorBot.Infrastructure;
 using Microsoft.Extensions.Configuration;
@@ -41,6 +42,8 @@ builder.Services.AddSingleton<SqliteConversationStore>();
 builder.Services.AddSingleton<IConversationStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IMediatedRequestStore>(services =>
+    services.GetRequiredService<SqliteConversationStore>());
+builder.Services.AddSingleton<IInitiativeStore>(services =>
     services.GetRequiredService<SqliteConversationStore>());
 builder.Services.AddSingleton<IConversationContextBuilder>(services =>
     new ConversationContextBuilder(
@@ -121,6 +124,49 @@ builder.Services.AddSingleton<IMediatorDeliveryRecorder, MediatorDeliveryRecorde
 using var host = builder.Build();
 var store = host.Services.GetRequiredService<SqliteConversationStore>();
 await store.InitializeAsync();
+
+var initiativeReportPath = builder.Configuration["initiative-report"];
+if (!string.IsNullOrWhiteSpace(initiativeReportPath))
+{
+    var reportSessionText = builder.Configuration["session"];
+    if (!Guid.TryParse(reportSessionText, out var reportSessionId))
+    {
+        throw new InvalidOperationException(
+            "--session <SessionId> is required for --initiative-report.");
+    }
+
+    var reportSession = await store.GetSessionAsync(reportSessionId)
+        ?? throw new KeyNotFoundException(
+            $"Session '{reportSessionId}' was not found.");
+    var reportLimit = builder.Configuration.GetValue<int?>(
+        "initiative-report-limit") ?? 500;
+    ArgumentOutOfRangeException.ThrowIfNegativeOrZero(reportLimit);
+    var decisions = await store.GetRecentDecisionsAsync(
+        reportSession.Id,
+        reportLimit);
+    var absoluteReportPath = Path.GetFullPath(
+        initiativeReportPath,
+        Directory.GetCurrentDirectory());
+    var reportDirectory = Path.GetDirectoryName(absoluteReportPath);
+    if (!string.IsNullOrWhiteSpace(reportDirectory))
+    {
+        Directory.CreateDirectory(reportDirectory);
+    }
+
+    await File.WriteAllTextAsync(
+        absoluteReportPath,
+        InitiativeHtmlReportGenerator.Generate(reportSession, decisions));
+    if (!OperatingSystem.IsWindows())
+    {
+        File.SetUnixFileMode(
+            absoluteReportPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    System.Console.WriteLine(
+        $"Initiative report created: {absoluteReportPath}; decisions: {decisions.Count}.");
+    return;
+}
 
 var session = await GetOrCreateSessionAsync(
     store,

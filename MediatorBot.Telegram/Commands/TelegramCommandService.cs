@@ -31,6 +31,8 @@ public sealed class TelegramCommandService(
             true,
             $"Вы подключены к активной mediator session как {role} " +
             $"({binding.Participant.DisplayName}). Сообщения второго участника остаются приватными. " +
+            "Медиатор может осторожно проявлять инициативу в подходящий момент; " +
+            "её можно отключить командой /proactive_off. " +
             "В продолжительных диалогах важное сохраняется в краткой памяти медиатора, " +
             "а старые подробные сообщения после успешного сжатия удаляются.");
     }
@@ -123,7 +125,8 @@ public sealed class TelegramCommandService(
             "Напишите сообщение в личном чате, и медиатор решит, кому и как ответить. " +
             "При длительном общении бот сохраняет важное в краткой памяти и удаляет " +
             "успешно сжатые старые подробности. " +
-            "Команды: /start, /status, /retry_failed, /help.");
+            "Команды: /start, /status, /retry_failed, /proactive_status, " +
+            "/proactive_on, /proactive_off, /help.");
     }
 
     private static TelegramCommandResponse UnknownUser() => new(

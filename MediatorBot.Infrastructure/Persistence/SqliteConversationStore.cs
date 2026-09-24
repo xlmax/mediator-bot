@@ -7,17 +7,19 @@ using Microsoft.Data.Sqlite;
 
 namespace MediatorBot.Infrastructure;
 
-public sealed class SqliteConversationStore :
+public sealed partial class SqliteConversationStore :
     IConversationStore,
     IParticipantIdentityStore,
     IExternalUpdateStore,
     IExternalTurnQueueStore,
     ITurnExecutionStore,
     IMediatedRequestStore,
-    IConversationCompactionStore
+    IConversationCompactionStore,
+    IInitiativeStore,
+    IInitiativeDeliveryStore
 {
     private const int BaseSchemaVersion = 4;
-    private const int CurrentSchemaVersion = 8;
+    private const int CurrentSchemaVersion = 9;
     private const string SchemaResourceName =
         "MediatorBot.Infrastructure.Persistence.Schema.sql";
 
@@ -26,7 +28,8 @@ public sealed class SqliteConversationStore :
         (5, "MediatorBot.Infrastructure.Persistence.Migrations.005_AddConversationSummaries.sql"),
         (6, "MediatorBot.Infrastructure.Persistence.Migrations.006_AddPendingTurns.sql"),
         (7, "MediatorBot.Infrastructure.Persistence.Migrations.007_AddReliableTurnExecution.sql"),
-        (8, "MediatorBot.Infrastructure.Persistence.Migrations.008_AddFailedTurnQuarantine.sql")
+        (8, "MediatorBot.Infrastructure.Persistence.Migrations.008_AddFailedTurnQuarantine.sql"),
+        (9, "MediatorBot.Infrastructure.Persistence.Migrations.009_AddProactiveInitiatives.sql")
     ];
 
     private static readonly Lazy<bool> SqliteRuntime = new(() =>

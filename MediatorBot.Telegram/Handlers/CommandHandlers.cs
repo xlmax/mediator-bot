@@ -5,7 +5,9 @@ namespace MediatorBot.Telegram;
 
 [ChatType(TelegramChatType.Private)]
 [UseFilter<AllowedParticipantFilter>]
-public sealed class CommandHandlers(TelegramCommandService commandService)
+public sealed class CommandHandlers(
+    TelegramCommandService commandService,
+    TelegramInitiativeCommandService initiativeCommandService)
 {
     [Command("start")]
     public async Task StartAsync(MessageContext context, CancellationToken cancellationToken)
@@ -31,6 +33,39 @@ public sealed class CommandHandlers(TelegramCommandService commandService)
         CancellationToken cancellationToken)
     {
         var response = await commandService.RetryFailedAsync(
+            GetTelegramUserId(context),
+            cancellationToken);
+        await context.Message.AnswerAsync(response.Text, cancellationToken);
+    }
+
+    [Command("proactive_on")]
+    public async Task ProactiveOnAsync(
+        MessageContext context,
+        CancellationToken cancellationToken)
+    {
+        var response = await initiativeCommandService.EnableAsync(
+            GetTelegramUserId(context),
+            cancellationToken);
+        await context.Message.AnswerAsync(response.Text, cancellationToken);
+    }
+
+    [Command("proactive_off")]
+    public async Task ProactiveOffAsync(
+        MessageContext context,
+        CancellationToken cancellationToken)
+    {
+        var response = await initiativeCommandService.DisableAsync(
+            GetTelegramUserId(context),
+            cancellationToken);
+        await context.Message.AnswerAsync(response.Text, cancellationToken);
+    }
+
+    [Command("proactive_status")]
+    public async Task ProactiveStatusAsync(
+        MessageContext context,
+        CancellationToken cancellationToken)
+    {
+        var response = await initiativeCommandService.GetStatusAsync(
             GetTelegramUserId(context),
             cancellationToken);
         await context.Message.AnswerAsync(response.Text, cancellationToken);
