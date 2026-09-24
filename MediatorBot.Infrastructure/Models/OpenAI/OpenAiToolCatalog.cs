@@ -13,7 +13,7 @@ public static class OpenAiToolCatalog
     [
         new(
             SendToParticipant,
-            "Send a private mediator message to exactly one participant in the current session.",
+            "Send one participant a warm, concrete mediator response that provides useful movement rather than commentary alone.",
             """
             {
               "type": "object",
@@ -24,12 +24,12 @@ public static class OpenAiToolCatalog
                 },
                 "text": {
                   "type": "string",
-                  "description": "Private message to send to this participant."
+                  "description": "Natural mediator message grounded in the situation. For an unresolved significant topic, include a useful observation, option, formulation, or next step; avoid unsolicited privacy disclaimers."
                 },
                 "disclosureDecision": {
                   "type": "string",
                   "enum": ["PrivateResponse", "MediatorDisclosure", "ExplicitTransfer", "SafetyDisclosure"],
-                  "description": "Mediation classification. Use PrivateResponse for PrivateSupport to the current author. Use MediatorDisclosure for a SafeParaphrase or an initiative BridgeIntervention that conveys minimal relationship-relevant meaning without raw private content. ExplicitTransfer and SafetyDisclosure keep their special meanings."
+                  "description": "Mediation classification. Use PrivateResponse for PrivateSupport to the current author. Use MediatorDisclosure for a SafeParaphrase or initiative BridgeIntervention. Use ExplicitTransfer only when the author unmistakably asked the mediator to send the message; asking for help wording what the author might say is PrivateResponse. SafetyDisclosure is reserved for a safety exception."
                 }
               },
               "required": ["participantId", "text", "disclosureDecision"],
@@ -38,18 +38,18 @@ public static class OpenAiToolCatalog
             """),
         new(
             SendToBoth,
-            "Send separate private mediator messages to both participants.",
+            "Send coordinated private mediator messages to both participants to create one shared bridge or invite them into one bounded mediation step.",
             """
             {
               "type": "object",
               "properties": {
                 "textForA": {
                   "type": "string",
-                  "description": "Private message addressed to Participant A."
+                  "description": "Warm and concrete message for Participant A, aligned with the same mediation goal as textForB."
                 },
                 "textForB": {
                   "type": "string",
-                  "description": "Private message addressed to Participant B."
+                  "description": "Warm and concrete message for Participant B, aligned with the same mediation goal as textForA."
                 },
                 "disclosureDecision": {
                   "type": "string",
@@ -156,7 +156,7 @@ public static class OpenAiToolCatalog
             """),
         new(
             NoAction,
-            "Do not send any message to either participant at this time.",
+            "Send nothing only when silence is more useful than both a concrete response to the current author and a safe mediation step.",
             """
             {
               "type": "object",

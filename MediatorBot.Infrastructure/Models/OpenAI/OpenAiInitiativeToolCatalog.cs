@@ -8,7 +8,7 @@ public static class OpenAiInitiativeToolCatalog
     [
         new(
             RecordDecision,
-            "Record exactly one proactive mediation decision. A future plan is never sent automatically and will be reevaluated with fresh context.",
+            "Record one proactive mediation decision. Contact only when it enables a concrete next step; future plans are always reevaluated with fresh context.",
             """
             {
               "type": "object",
@@ -41,8 +41,14 @@ public static class OpenAiInitiativeToolCatalog
                   "type": "string",
                   "description": "Short operational reason, at most 500 characters. No chain-of-thought and no quotes from private messages."
                 },
-                "textForParticipantA": { "type": ["string", "null"] },
-                "textForParticipantB": { "type": ["string", "null"] },
+                "textForParticipantA": {
+                  "type": ["string", "null"],
+                  "description": "Warm, context-grounded message with a concrete offer or bounded mediation step; never a generic check-in or unsolicited privacy explanation."
+                },
+                "textForParticipantB": {
+                  "type": ["string", "null"],
+                  "description": "Warm, context-grounded message with a concrete offer or bounded mediation step; never a generic check-in or unsolicited privacy explanation."
+                },
                 "reevaluateAfterMinutes": {
                   "type": "integer",
                   "minimum": 30,

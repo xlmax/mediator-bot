@@ -48,7 +48,7 @@ public sealed class OpenAiInitiativeRuntimeTests
         Assert.Equal(OpenAiInitiativeToolCatalog.RecordDecision, captured.Tools[0].Name);
         Assert.Contains(context.LatestParticipantMessage.CreatedAt.ToString("O"),
             captured.ConversationPrompt);
-        Assert.Contains("Никто не писал тебе прямо сейчас", captured.SystemPrompt);
+        Assert.Contains("никто не написал прямо сейчас", captured.SystemPrompt);
     }
 
     [Fact]

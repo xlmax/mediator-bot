@@ -139,77 +139,59 @@ public sealed class OpenAiConversationPromptBuilderTests
     }
 
     [Fact]
-    public void SystemPrompt_SeparatesMediatorKnowledgeFromDisclosure()
+    public void SystemPrompt_RequiresWarmConcreteMovement()
     {
         var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
 
-        Assert.Contains("mediation-first with privacy constraints", prompt);
-        Assert.Contains("не пересказывай лишнее, но активно передавай полезный смысл", prompt);
-        Assert.Contains("Mediator knowledge", prompt);
-        Assert.Contains("Participant-visible information", prompt);
+        Assert.Contains("тёплый и деятельный медиатор", prompt);
+        Assert.Contains("одновременно понятым и чуть ближе", prompt);
+        Assert.Contains("Теплота не равна автоматическому согласию", prompt);
+        Assert.Contains("одного сочувственного комментария недостаточно", prompt);
+        Assert.Contains("предложи следующий шаг сам", prompt);
+        Assert.Contains("не требуется подтверждённая позиция партнёра", prompt);
+        Assert.Contains("ограниченную посредническую процедуру", prompt);
+        Assert.Contains("если тот же мост или предложение уже были ему доставлены", prompt);
+        Assert.Contains("Не используй осторожность раскрытия как повод ничего не предложить", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_TreatsPrivacyAsSilentConditionalBoundary()
+    {
+        var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
+
+        Assert.Contains("PRIVACY — SILENT BOUNDARY", prompt);
+        Assert.Contains("mediator knowledge", prompt);
         Assert.Contains("raw private content", prompt);
         Assert.Contains("relationship-relevant meaning", prompt);
-        Assert.Contains("исходные формулировки каждого входящего сообщения — Private", prompt);
-        Assert.Contains("не даёт неограниченного разрешения", prompt);
-        Assert.Contains("не называй источник", prompt, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("только «да/нет» не создают разрешения", prompt);
-        Assert.Contains("Не выдавай подробный отчёт", prompt);
-        Assert.Contains("утверждения участников, а не установленные факты", prompt);
-        Assert.Contains("не должна постоянно синхронизировать", prompt);
-        Assert.Contains("MEDIATED REQUEST LIFECYCLE", prompt);
-        Assert.Contains("Не оставляй инициатора в ожидании", prompt);
+        Assert.Contains("внутренняя рабочая граница, а не тема каждого ответа", prompt);
+        Assert.Contains("не обещай «ничего не передавать»", prompt);
+        Assert.Contains("Озвучивай границу кратко только когда", prompt);
+        Assert.Contains("только «да/нет» не дают разрешения", prompt);
+        Assert.Contains("не становятся safe paraphrase", prompt);
+        Assert.Contains("формально объявляет границу и тут же раскрывает содержание", prompt);
+        Assert.Contains("После необходимого ограничения возвращай разговор", prompt);
+        Assert.Contains("не раскрывай факт обращения", prompt);
     }
 
     [Fact]
-    public void SystemPrompt_RequiresMediationFirstBridgeSearch()
+    public void SystemPrompt_BalancesRuminationMediationAndSafety()
     {
         var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
 
-        Assert.Contains("MEDIATION-FIRST AND BRIDGE SEARCH", prompt);
-        Assert.Contains("При каждом значимом turn активно ищи", prompt);
-        Assert.Contains("взаимно совместимые желания", prompt);
-        Assert.Contains("ошибочное представление одного участника о мотивах другого", prompt);
-        Assert.Contains("Если найден мост, рассмотри инициативное сообщение", prompt);
-        Assert.Contains("mediator inference", prompt);
-        Assert.Contains("relationship-level meaning", prompt);
-        Assert.Contains("отношения по-прежнему важны", prompt);
-        Assert.Contains("не раскрывай сопутствующую летучую эмоцию", prompt);
-        Assert.Contains("не упоминай гнев, сильное напряжение", prompt);
-        Assert.Contains("редкие высокоценные смысловые единицы", prompt);
-        Assert.Contains("Порог BridgeIntervention обычно требует", prompt);
-        Assert.Contains("Односторонняя жалоба", prompt);
-        Assert.Contains("Не сообщай второй стороне о предполагаемом заблуждении", prompt);
-        Assert.Contains("Перед NoAction или ответом только текущему автору", prompt);
-        Assert.Contains("Если да, предпочти mediated intervention", prompt);
-        Assert.Contains("Инициативное сообщение другому участнику — нормальный инструмент", prompt);
-        Assert.Contains("не путай активность с немедленной отправкой", prompt);
-        Assert.Contains("не автоматического контакта с предполагаемым источником опасности", prompt);
-        Assert.Contains("Не предупреждай, не увещевай и не конфронтируй", prompt);
-        Assert.DoesNotContain(
-            "При сомнении предпочитай PrivateResponse или NoAction",
-            prompt);
-    }
-
-    [Fact]
-    public void SystemPrompt_DefinesProportionalAntiRuminationPolicy()
-    {
-        var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
-
-        Assert.Contains("PROPORTIONALITY AND ANTI-RUMINATION", prompt);
-        Assert.Contains("Не каждое раздражение требует анализа", prompt);
-        Assert.Contains("Не создавай глубину там, где её может не быть", prompt);
-        Assert.Contains("VENT, REFLECT, MEDIATE", prompt);
-        Assert.Contains("Предпочитай естественное угасание мелких эмоций", prompt);
-        Assert.Contains("Не превращай себя в журнал претензий", prompt);
-        Assert.Contains("Не поддерживай grievance amplification", prompt);
-        Assert.Contains("сохраняется ли проблема после снижения эмоций", prompt);
-        Assert.Contains("Анти-руминационная политика не означает", prompt);
-        Assert.Contains("не задавай обязательный уточняющий вопрос", prompt);
-        Assert.Contains("не отменяет INFORMATION BOUNDARY", prompt);
-        Assert.Contains("значимый мост требует отдельной активной оценки", prompt);
-        Assert.True(
-            prompt.IndexOf("PROPORTIONALITY AND ANTI-RUMINATION", StringComparison.Ordinal) <
-            prompt.IndexOf("DISCLOSURE DECISIONS", StringComparison.Ordinal));
+        Assert.Contains("PROPORTIONALITY AND RUMINATION", prompt);
+        Assert.Contains("короткий живой отклик", prompt);
+        Assert.Contains("Не усиливай переживание собственными словами", prompt);
+        Assert.Contains("почувствовал себя брошенным", prompt);
+        Assert.Contains("что готов сделать сам", prompt);
+        Assert.Contains("Признание эмоции не означает подтверждения обвинительной версии", prompt);
+        Assert.Contains("архивом доказательств", prompt);
+        Assert.Contains("Не предлагай таблицу, перечень или систематизацию", prompt);
+        Assert.Contains("Не отвечай приглашениями «выговорись»", prompt);
+        Assert.Contains("сформулировать действие, взять паузу или закончить тему", prompt);
+        Assert.Contains("не являются «обычной руминацией»", prompt);
+        Assert.Contains("BridgeIntervention", prompt);
+        Assert.Contains("MEDIATED REQUESTS", prompt);
+        Assert.Contains("NoShareableAnswer", prompt);
     }
 
     [Theory]
@@ -227,16 +209,27 @@ public sealed class OpenAiConversationPromptBuilderTests
     }
 
     [Fact]
-    public void SystemPrompt_RequiresClassifiedToolBasedMediation()
+    public void SystemPrompt_RequiresNaturalToolBasedMediation()
     {
         var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
 
-        Assert.Contains("только через предоставленные инструменты", prompt);
-        Assert.Contains("укажи соответствующий disclosureDecision", prompt);
-        Assert.Contains(
-            "PrivateResponse соответствует PrivateSupport и допустим только",
-            prompt);
-        Assert.Contains("используй DisplayName", prompt);
+        Assert.Contains("естественным русским языком", prompt);
+        Assert.Contains("без канцелярита", prompt);
+        Assert.Contains("не обязано быть только эмоциональной поддержкой", prompt);
+        Assert.Contains("Просьба «помоги сказать»", prompt);
+        Assert.Contains("только из оскорбления", prompt);
+        Assert.Contains("ровно одно действие через предоставленные инструменты", prompt);
+        Assert.Contains("не добавляй обычный assistant text", prompt);
+        Assert.Contains("Используй DisplayName естественно", prompt);
+    }
+
+    [Fact]
+    public void SystemPrompt_IsNotDominatedByProhibitions()
+    {
+        var prompt = OpenAiConversationPromptBuilder.SystemPrompt;
+
+        Assert.True(prompt.Length < 12_000);
+        Assert.True(CountOccurrences(prompt.ToLowerInvariant(), "не ") < 70);
     }
 
     private static int CountOccurrences(string value, string search)
