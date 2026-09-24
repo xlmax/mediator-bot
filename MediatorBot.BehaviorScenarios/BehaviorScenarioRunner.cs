@@ -4,6 +4,16 @@ using MediatorBot.Infrastructure;
 
 namespace MediatorBot.BehaviorScenarios;
 
+internal enum BehaviorActionCategory
+{
+    PrivateSupport,
+    SafeParaphrase,
+    BridgeIntervention,
+    ExplicitTransfer,
+    SafetyDisclosure,
+    NoAction
+}
+
 internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
 {
     public async Task<string> RunAsync(
@@ -18,6 +28,8 @@ internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
         var transcript = new StringBuilder();
         var decisionCounts = Enum.GetValues<DisclosureDecision>()
             .ToDictionary(decision => decision, _ => 0);
+        var categoryCounts = Enum.GetValues<BehaviorActionCategory>()
+            .ToDictionary(category => category, _ => 0);
         transcript.AppendLine("# Disclosure policy behavioural scenarios");
         transcript.AppendLine();
         transcript.AppendLine($"- UTC: {DateTimeOffset.UtcNow:O}");
@@ -46,6 +58,7 @@ internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
                 scenario,
                 transcript,
                 decisionCounts,
+                categoryCounts,
                 cancellationToken);
         }
 
@@ -54,6 +67,14 @@ internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
         foreach (var decision in Enum.GetValues<DisclosureDecision>())
         {
             transcript.AppendLine($"- `{decision}`: {decisionCounts[decision]}");
+        }
+
+        transcript.AppendLine();
+        transcript.AppendLine("## Behaviour category summary");
+        transcript.AppendLine();
+        foreach (var category in Enum.GetValues<BehaviorActionCategory>())
+        {
+            transcript.AppendLine($"- `{category}`: {categoryCounts[category]}");
         }
 
         var absoluteDirectory = Path.GetFullPath(
@@ -79,6 +100,7 @@ internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
         BehaviorScenario scenario,
         StringBuilder transcript,
         IDictionary<DisclosureDecision, int> decisionCounts,
+        IDictionary<BehaviorActionCategory, int> categoryCounts,
         CancellationToken cancellationToken)
     {
         var participantA = new Participant(Guid.NewGuid(), "Алексей");
@@ -130,9 +152,13 @@ internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
                     cancellationToken);
                 var action = AssertSingleAction(result);
                 decisionCounts[action.DisclosureDecision]++;
+                var category = ClassifyAction(action, author.Id);
+                categoryCounts[category]++;
 
                 transcript.AppendLine(
                     $"**DisclosureDecision:** `{action.DisclosureDecision}`");
+                transcript.AppendLine(
+                    $"**BehaviourCategory:** `{category}`");
                 transcript.AppendLine();
                 AppendAction(
                     transcript,
@@ -164,6 +190,26 @@ internal sealed class BehaviorScenarioRunner(IModelRuntime modelRuntime)
             }
         }
     }
+
+    private static BehaviorActionCategory ClassifyAction(
+        MediatorAction action,
+        Guid currentAuthorId) =>
+        action.DisclosureDecision switch
+        {
+            DisclosureDecision.PrivateResponse => BehaviorActionCategory.PrivateSupport,
+            DisclosureDecision.MediatorDisclosure when action is SendToBoth =>
+                BehaviorActionCategory.BridgeIntervention,
+            DisclosureDecision.MediatorDisclosure when
+                action is SendToParticipant send &&
+                send.ParticipantId != currentAuthorId =>
+                    BehaviorActionCategory.BridgeIntervention,
+            DisclosureDecision.MediatorDisclosure => BehaviorActionCategory.SafeParaphrase,
+            DisclosureDecision.ExplicitTransfer => BehaviorActionCategory.ExplicitTransfer,
+            DisclosureDecision.SafetyDisclosure => BehaviorActionCategory.SafetyDisclosure,
+            DisclosureDecision.NoAction => BehaviorActionCategory.NoAction,
+            _ => throw new InvalidDataException(
+                $"Unsupported disclosure decision '{action.DisclosureDecision}'.")
+        };
 
     private static MediatorAction AssertSingleAction(ModelResult result)
     {

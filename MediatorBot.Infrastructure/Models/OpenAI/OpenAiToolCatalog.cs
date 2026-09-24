@@ -29,7 +29,7 @@ public static class OpenAiToolCatalog
                 "disclosureDecision": {
                   "type": "string",
                   "enum": ["PrivateResponse", "MediatorDisclosure", "ExplicitTransfer", "SafetyDisclosure"],
-                  "description": "Privacy decision for this message. PrivateResponse is allowed only when replying to the current author without exposing the other participant's private information."
+                  "description": "Mediation classification. Use PrivateResponse for PrivateSupport to the current author. Use MediatorDisclosure for a SafeParaphrase or an initiative BridgeIntervention that conveys minimal relationship-relevant meaning without raw private content. ExplicitTransfer and SafetyDisclosure keep their special meanings."
                 }
               },
               "required": ["participantId", "text", "disclosureDecision"],
@@ -54,7 +54,7 @@ public static class OpenAiToolCatalog
                 "disclosureDecision": {
                   "type": "string",
                   "enum": ["MediatorDisclosure", "ExplicitTransfer", "SafetyDisclosure"],
-                  "description": "Privacy decision that justifies contacting both participants."
+                  "description": "Mediation classification for contacting both participants. Use MediatorDisclosure for a BridgeIntervention or SafeParaphrase, ExplicitTransfer for a requested constructive transfer, and SafetyDisclosure only for a safety exception."
                 }
               },
               "required": ["textForA", "textForB", "disclosureDecision"],
@@ -118,7 +118,8 @@ public static class OpenAiToolCatalog
                 },
                 "disclosureDecision": {
                   "type": "string",
-                  "enum": ["ExplicitTransfer", "MediatorDisclosure", "SafetyDisclosure"]
+                  "enum": ["ExplicitTransfer", "MediatorDisclosure", "SafetyDisclosure"],
+                  "description": "Must be ExplicitTransfer for Answered, MediatorDisclosure for Declined or NoShareableAnswer, or SafetyDisclosure only for an Answered safety exception."
                 }
               },
               "required": ["requestId", "outcome", "textForRequester", "disclosureDecision"],
