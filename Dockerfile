@@ -20,7 +20,7 @@ RUN dotnet publish MediatorBot.Telegram/MediatorBot.Telegram.csproj \
     --output /app/publish \
     /p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/runtime:11.0 AS runtime
 WORKDIR /app
 
 ENV DOTNET_ENVIRONMENT=Production \
